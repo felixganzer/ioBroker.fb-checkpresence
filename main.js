@@ -491,6 +491,7 @@ class FbCheckpresence extends utils.Adapter {
             if (this.SETENABLE === true && this.WLAN3INFO === true) this.subscribeStates(`${this.namespace}` + '.guest.wlan');
             if (this.DISALLOWWANACCESSBYIP === true && this.GETWANACCESSBYIP === true) this.subscribeStates(`${this.namespace}` + '.fb-devices.*.disabled');  
             if (this.REBOOT === true) this.subscribeStates(`${this.namespace}` + '.reboot');  
+            this.subscribeStates(`${this.namespace}` + '.readFamilyMember'); 
 
             this.loop(10, 55, cronFamily, cron, cfg);
         } catch (error) {
@@ -578,9 +579,9 @@ class FbCheckpresence extends utils.Adapter {
                         }
                     }
                 }
-
+                
                 if (id == `${this.namespace}` + '.readFamilyMember'){
-                    
+
                     this.log.info(`${id} changed: ${state.val} (ack = ${state.ack})`);
                     if (state.val === true){
                         const gthis = this;
