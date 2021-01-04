@@ -580,6 +580,7 @@ class FbCheckpresence extends utils.Adapter {
                 }
 
                 if (id == `${this.namespace}` + '.readFamilyMember'){
+                    
                     this.log.info(`${id} changed: ${state.val} (ack = ${state.ack})`);
                     if (state.val === true){
                         const gthis = this;
