@@ -164,6 +164,7 @@ class FbCheckpresence extends utils.Adapter {
         }
     }
 
+    // int1 : family
     loop(cnt1, cnt2, int1, int2, cfg) {
         try {
             const gthis = this;
@@ -575,6 +576,35 @@ class FbCheckpresence extends utils.Adapter {
                             this.setState(`${this.namespace}` + '.reboot', { val: false, ack: true });
                             throw('reboot failure! ' + JSON.stringify(reboot));
                         }
+                    }
+                }
+
+                if (id == `${this.namespace}` + '.readFamilyMember'){
+                    this.log.info(`${id} changed: ${state.val} (ack = ${state.ack})`);
+                    if (state.val === true){
+                        const gthis = this;
+                        const work = process.hrtime();
+                        const cfg = {
+                            ip: this.config.ipaddress,
+                            port: '49000',
+                            iv: this.config.interval,
+                            history: this.config.history,
+                            dateFormat: this.config.dateformat,
+                            uid: this.config.username,
+                            pwd: this.config.password,
+                            members: this.config.familymembers,
+                            wl: this.config.whitelist
+                        };
+                        let time = null;
+                        gthis.log.info('loopFamily starts');
+                        if (this.DEVINFO == true) {
+                            await gthis.Fb.connectionCheck(); //Sets the connection led
+                        }
+                        //const itemlist = await Fb.getDeviceList();
+                        await gthis.checkPresence(cfg);
+                        time = process.hrtime(work);
+                        this.log.debug('loopFamily ends after ' + time + ' s');
+                        this.setState(`${this.namespace}` + '.readFamilyMember', { val: false, ack: true });    
                     }
                 }
             }
