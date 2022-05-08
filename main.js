@@ -13,12 +13,15 @@ const dateFormat = require('dateformat');
 const fb = require('./lib/fb');
 const obj = require('./lib/objects');
 
-/*Array.prototype.indexOfObject = function (property, value, ind=-1) {
-    for (let i = 0, len = this.length; i < len; i++) {
-        if (i != ind && this[i][property] === value) return i;
+class Warn extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'Warning';
+        this.toString = function() {
+            return this.name + ': ' + this.message;
+        };
     }
-    return -1;
-};*/
+}
 
 class FbCheckpresence extends utils.Adapter {
 
@@ -30,12 +33,14 @@ class FbCheckpresence extends utils.Adapter {
             ...options,
             name: 'fb-checkpresence',
         });
+        
         //events
         this.on('ready', this.onReady.bind(this));
         //this.on('objectChange', this.onObjectChange);
         this.on('stateChange', this.onStateChange.bind(this));
         this.on('message', this.onMessage.bind(this));
         this.on('unload', this.onUnload.bind(this));
+        
         //constants
         this.urn = 'urn:dslforum-org:service:';
         this.HTML = '<table class="mdui-table"><thead><tr><th>Name</th><th>Status</th><th>Kommt</th><th>Geht</th></tr></thead><tbody>';
@@ -43,39 +48,64 @@ class FbCheckpresence extends utils.Adapter {
         this.HTML_END = '</body></table>';
         this.HTML_GUEST  = '<table class="mdui-table"><thead><tr><th>Hostname</th><th>IPAddress</th><th>MACAddress</th></tr></thead><tbody>';
         this.HTML_FB  = '<table class="mdui-table"><thead><tr><th>Hostname</th><th>IPAddress</th><th>MACAddress</th><th>Active</th><th>Type</th></tr></thead><tbody>';
-        //this.FORBIDDEN_CHARS = /[\]\[*,;'"`<>\\?]/g;
+        
+        this.FORBIDDEN_CHARS = /[\][.*,;'"`<>\\?\s]+/g;
+
         this.errorCntMax = 10;
 
         this.allDevices = [];
+        this.adapterStates = [];
+        this.memberStates = [];
+        this.historyAlive = false;
+        this.hosts = null;
         this.jsonTab;
         this.htmlTab;
         this.enabled = true;
         this.errorCnt = 0;
         this.Fb = null;
-        this.timeout = null;
-
-        //http://fritz.box:49000/tr64desc.xml
-        //used actions
-        this.GETPATH = false;
-        this.GETMESHPATH = false;
-        this.GETBYMAC = false;
-        this.GETBYIP = false;
-        this.GETPORT = false;
-        this.GETEXTIP = false;
-        this.SETENABLE = false;
-        this.WLAN3INFO = false;
-        this.DEVINFO = false;
-        this.GETWANACCESSBYIP = false;
-        this.DISALLOWWANACCESSBYIP = false;
-        this.REBOOT = false;
+        this.tout = null;
+        this.suppressMesg = false;
+        this.suppressArr = [];
     }
 
-    decrypt(key, value) {
-        let result = '';
-        for (let i = 0; i < value.length; ++i) {
-            result += String.fromCharCode(key[i % key.length].charCodeAt(0) ^ value.charCodeAt(i));
+    errorHandler(error, title){
+        //if(adapter === null) adapter = this;
+        if (typeof error === 'string') {
+            if (error.name === undefined || error.message === undefined){
+                this.log.warn(title + ' ' + JSON.stringify(error));
+            }else{
+                this.log.warn(title + ' ' + error.name + ': ' + error.message);
+            }
+            //this.log.warn(title + error.name + ' ' + error.message);
         }
-        return result;
+        else if (typeof error === 'object')
+        {
+            if (error instanceof TypeError) {
+                //this.log.error(title + ' ' + error.name + ': ' + error.message);
+                if (error.name === undefined || error.message === undefined){
+                    this.log.warn(title + ' ' + JSON.stringify(error));
+                }else{
+                    this.log.warn(title + ' ' + error.name + ': ' + error.message);
+                }
+            }else if (error instanceof Error){
+                if (error.message == 'NoSuchEntryInArray' && this.suppressMesg == false){
+                    this.log.warn(title + ' ' + error.name + ': ' + error.message + ' -> please check entry (mac, ip, hostname) in configuration! It is not listed in the Fritzbox device list');
+                    this.suppressMesg = true;
+                }
+                if (error.message.includes('EHOSTUNREACH')){
+                    this.log.warn(title + ' ' + error.name + ': ' + error.message + ' -> please check fritzbox connection! Ip-address in configuration correct?');
+                }
+                if (error.message != 'NoSuchEntryInArray' && !error.message.includes('EHOSTUNREACH')){
+                    if (error.name === undefined || error.message === undefined){
+                        this.log.warn(title + ' ' + JSON.stringify(error));
+                    }else{
+                        this.log.warn(title + ' ' + error.name + ': ' + error.message);
+                    }
+                }
+            }else{
+                this.log.warn(title + ' ' + error.name + ': ' + JSON.stringify(error));
+            }
+        }
     }
 
     showError(errorMsg) {
@@ -87,6 +117,10 @@ class FbCheckpresence extends utils.Adapter {
         }
     }
 
+    _sleep(milliseconds) {
+        return new Promise(resolve => setTimeout(resolve, milliseconds));
+    }
+
     createHTMLTableRow (dataArray) {
         let html = '';
         html += '<tr>'; //new row
@@ -94,6 +128,7 @@ class FbCheckpresence extends utils.Adapter {
             html += '<td>' + dataArray[c] + '</td>'; //columns
         }
         html += '</tr>'; //row end
+        //dataArray = null;
         return html;
     }
 
@@ -110,8 +145,61 @@ class FbCheckpresence extends utils.Adapter {
                 json += '"'  + dataArray[c+1] + '",';
             }
         }
+        //dataArray = null;
         return json;
     }
+
+    getAdapterState(id){
+        try {
+            const ind = this.adapterStates.findIndex(x => x.id == id);
+            if (ind != -1){
+                return true;
+            }else{
+                return false;
+            }
+        } catch (error) {
+            this.errorHandler(error, 'getAdapterState: '); 
+        }
+    }
+
+    /*setStateIfNotEqual(id, options){
+        try {
+            let ind = this.adapterStates.findIndex(x => x.id == id);
+            if (ind != -1 &&  this.adapterStates[ind].state.val != options.val){
+                this.setState(id, options);
+                this.adapterStates[ind].state.val = options.val;
+                ind = 0;
+                return true;
+            }else{
+                return false;
+            }
+        } catch (error) {
+            this.errorHandler(error, 'setStateIfNotEqual: '); 
+        }
+    }*/
+
+    /*setStateFiltered(id, options){
+        try {
+            const ind = this.memberStates.findIndex(x => x.id == id);
+            if (ind != -1 && this.memberStates[ind].state.val == false && options.val == true){
+                if (this.setStateChangedAsync(id, options)) this.log.info('0 ' + id + ' ' + options.val);
+                this.memberStates[ind].state.val = options.val;
+                return;
+            }       
+            if (ind != -1 &&  this.memberStates[ind].state.val == true && options.val == false){
+                this.memberStates[ind].state.val =  options.val;  
+                this.log.info('1 ' + id + ' ' + options.val);
+                return;
+            }       
+            if (ind != -1 &&  this.memberStates[ind].state.val == false && options.val == false){
+                if (this.setStateChangedAsync(id, options)) this.log.info('2 ' + id + ' ' + options.val);
+                this.memberStates[ind].state.val = options.val;
+                return;
+            }       
+        } catch (error) {
+            this.errorHandler(error, 'setStateFiltered: '); 
+        }
+    }*/
 
     async resyncFbObjects(items){
         try {
@@ -126,9 +214,7 @@ class FbCheckpresence extends utils.Adapter {
                         if (dName.includes('fb-devices.')){
                             for(let i=0;i<items.length;i++){
                                 let hostName = items[i]['HostName'];
-                                if (hostName.includes('.')){
-                                    hostName = hostName.replace('.', '-');
-                                }
+                                hostName = hostName.replace(this.FORBIDDEN_CHARS, '-');
                                 if (shortName == hostName) {
                                     found = true;
                                     break;
@@ -160,178 +246,123 @@ class FbCheckpresence extends utils.Adapter {
 
             }
         } catch (error) {
-            this.log.error('resyncFbObjects ' + JSON.stringify(error));
+            this.errorHandler(error, 'resyncFbObjects: '); 
         }
     }
 
-    // int1 : family
-    loop(cnt1, cnt2, int1, int2, cfg) {
+    async checkDevices(){
         try {
-            const gthis = this;
-            this.timeout = setTimeout(async function() {
-                try {
-                    cnt1++;
-                    cnt2++;
-                    const work = process.hrtime();
-                    let time = null;
-                    if (cnt1 == int1){
-                        //gthis.log.info('loopFamily starts');
-                        if (gthis.DEVINFO == true) {
-                            await gthis.Fb.connectionCheck(); //Sets the connection led
-                        }
-                        cnt1 = 0;
-                        //const itemlist = await Fb.getDeviceList();
-                        await gthis.checkPresence(cfg);
-                        time = process.hrtime(work);
-                        gthis.log.debug('loopFamily ends after ' + time + ' s');
-                    }
-                    if (cnt2 == int2){
-                        //gthis.log.debug('loopDevices starts');
-                        if (gthis.DEVINFO == true) {
-                            await gthis.Fb.connectionCheck(); //Sets the connection led
-                        }
-                        cnt2 = 0;
-                        if (gthis.GETPATH != null && gthis.GETPATH == true && gthis.config.fbdevices == true){
-                            let meshlist = null;
-                            const itemlist = await gthis.Fb.getDeviceList();
-                            if (gthis.GETEXTIP != null && gthis.GETEXTIP == true) await gthis.Fb.getExtIp();
-                            if (gthis.WLAN3INFO != null && gthis.WLAN3INFO == true) await gthis.Fb.getGuestWlan('guest.wlan');
-                            if (gthis.GETMESHPATH != null && gthis.GETMESHPATH == true && gthis.config.meshinfo == true) meshlist = await gthis.Fb.getMeshList();
-                            if (itemlist && meshlist) {
-                                const hosts = await gthis.getAllFbObjects(itemlist);
-                                await gthis.getDeviceInfo(hosts, meshlist, cfg);
-                            }
-                        }
-                        time = process.hrtime(work);
-                        gthis.log.debug('loopDevices ends after ' + time + ' s');
-                    }
-                    gthis.loop(cnt1, cnt2, int1, int2, cfg);
-                } catch (error) {
-                    gthis.log.error('loop: ' + JSON.stringify(error));
-                }
-            }, 1000);
-        } catch (error) {
-            this.log.error('loop: ' + JSON.stringify(error));
-        }                
-    }
-
-    async getAllFbObjects(items){
-        try {
-            const hosts = [];
-            // Get all fb-device objects of this adapter
-            const devices = await this.getDevicesAsync();
-            for (const id in devices) {
-                if (devices[id] != undefined && devices[id].common != undefined){
-                    const dName = devices[id].common.name;
-                    const shortNameOrg = dName.replace('fb-devices.', '');
-                    const shortName = shortNameOrg.replace('.', '-');
-                    if (dName.includes('fb-devices.')){
-                        const host = items.filter(x => x.HostName === shortNameOrg);
-                        const activeHost = host.filter(x => x.Active === '1');
-                        if (host){
-                            if (host.length == 0){
-                                const device = {
-                                    status: 'old',
-                                    dp: 'fb-devices.' + shortName,
-                                    hn: shortName,
-                                    hnOrg: shortNameOrg,
-                                    mac: await this.getStateAsync('fb-devices.' + shortName + '.macaddress').val,
-                                    ip: await this.getStateAsync('fb-devices.' + shortName + '.ipaddress').val,
-                                    active: 0,
-                                    data: null,
-                                    interfaceType: '',
-                                    speed: 0,
-                                    guest: 0
-                                };
-                                hosts.push(device);                                
-                            }
-                            if (host.length == 1){
-                                let hostName = host[0]['HostName'];
-                                if (hostName.includes('.')){
-                                    hostName = hostName.replace('.', '-');
-                                }
-                                const device = {
-                                    status: 'unchanged',
-                                    dp: 'fb-devices.' + hostName,
-                                    hn: hostName,
-                                    hnOrg: host[0]['HostName'],
-                                    mac: host[0]['MACAddress'],
-                                    ip: host[0]['IPAddress'],
-                                    active: host[0]['Active'],
-                                    data: host[0],
-                                    interfaceType: host[0]['InterfaceType'],
-                                    speed: host[0]['X_AVM-DE_Speed'],
-                                    guest: host[0]['X_AVM-DE_Guest']
-                                };
-                                hosts.push(device);
-                            }
-                            if (host.length > 1){
-                                if (activeHost.length > 0){
-                                    let hostName = activeHost[0]['HostName'];
-                                    if (hostName.includes('.')){
-                                        hostName = hostName.replace('.', '-');
-                                    }
-                                    const device = {
-                                        status: 'unchanged',
-                                        dp: 'fb-devices.' + hostName,
-                                        hn: hostName,
-                                        hnOrg: activeHost[0]['HostName'],
-                                        mac: activeHost[0]['MACAddress'],
-                                        ip: activeHost[0]['IPAddress'],
-                                        active: activeHost[0]['Active'],
-                                        data: activeHost[0],
-                                        interfaceType: activeHost[0]['InterfaceType'],
-                                        speed: activeHost[0]['X_AVM-DE_Speed'],
-                                        guest: activeHost[0]['X_AVM-DE_Guest']
-                                    };
-                                    hosts.push(device);
-                                }else{
-                                    let hostName = host[0]['HostName'];
-                                    if (hostName.includes('.')){
-                                        hostName = hostName.replace('.', '-');
-                                    }
-                                    const device = {
-                                        status: 'unchanged',
-                                        dp: 'fb-devices.' + hostName,
-                                        hn: hostName,
-                                        hnOrg: host[0]['HostName'],
-                                        mac: host[0]['MACAddress'],
-                                        ip: host[0]['IPAddress'],
-                                        active: host[0]['Active'],
-                                        data: host[0],
-                                        interfaceType: host[0]['InterfaceType'],
-                                        speed: host[0]['X_AVM-DE_Speed'],
-                                        guest: host[0]['X_AVM-DE_Guest']
-                                    };
-                                    hosts.push(device);
-                                }
-                            }
-                        }else{
-                            const device = {
-                                status: 'old',
-                                dp: 'fb-devices.' + shortName,
-                                hn: shortName,
-                                hnOrg: shortNameOrg,
-                                mac: await this.getStateAsync('fb-devices.' + shortName + '.macaddress').val,
-                                ip: await this.getStateAsync('fb-devices.' + shortName + '.ipaddress').val,
-                                active: 0,
-                                data: null,
-                                interfaceType: '',
-                                speed: 0,
-                                guest: 0
-                            };
-                            hosts.push(device);
-                        }
-                    }
+            await this.Fb.getDeviceList();
+            if (this.Fb.deviceList) {
+                this.setDeviceStates();
+                await this.getAllFbObjects();
+                if (this.hosts) {
+                    if (this.config.enableWl == true) await this.getWlBlInfo();
+                    if (this.config.fbdevices == true) await this.getDeviceInfo();
+                    if (this.Fb.GETMESHPATH != null && this.Fb.GETMESHPATH == true && this.config.meshinfo == true) await this.Fb.getMeshList();
+                    if (this.Fb.meshList && this.config.meshinfo == true) await this.getMeshInfo();
                 }
             }
+            this.Fb.deviceList = null;
+        } catch (error) {
+            this.errorHandler(error, 'checkDevices: '); 
+        }
+    }
+
+    async connCheck(){
+        try {
+            if (await this.Fb.connectionCheck()){
+                this.setState('info.connection', { val: true, ack: true });
+            }else{
+                this.setState('info.connection', { val: false, ack: true });
+            }
+            this.setState('info.lastUpdate', { val: (new Date()).toString(), ack: true });
+        } catch (error) {
+            this.errorHandler(error, 'connCheck: '); 
+        }
+    }
+
+    async loop(cnt1, cnt2, int1, int2) {
+        while(this.enabled === true){
+            this.tout = setTimeout(() => {
+                this.log.error('cycle error! Please restart the adapter');
+            }, 300000);
+            let time = null;
+            let work = null;
+            try {
+                await this._sleep(1000);
+                cnt1++;
+                cnt2++;
+                work = process.hrtime();
+                cnt1 < cnt2 && cnt1 >= int1 ? await this.connCheck() : cnt2 >= int2 ? await this.connCheck() : null;  
+                if (cnt1 >= int1){
+                    cnt1 = 0;
+                    //gthis.log.info('loopFamily starts');
+                    await this.checkPresence();
+                    time = process.hrtime(work);
+                    this.log.debug('loop family ends after ' + time + ' s');
+                }
+                if (cnt2 >= int2){
+                    cnt2 = 0;
+                    //gthis.log.debug('loopDevices starts');
+                    this.setStateChangedAsync('info.extIp', { val: await this.Fb.getExtIp(), ack: true });
+                    if (this.config.guestinfo === true){
+                        this.setState('guest.wlan', { val: await this.Fb.getGuestWlan(), ack: true });
+                    }
+                    if (this.config.qrcode === true){
+                        this.setState('guest.wlanQR', { val: await this.Fb.getGuestQR(), ack: true });
+                    }
+                    if (this.Fb.GETPATH != null && this.Fb.GETPATH == true && this.config.fbdevices == true){
+                        this.checkDevices();
+                    }
+                    /*const used = process.memoryUsage();
+                    let mesg = '';
+                    for (const key in used) {
+                        mesg += `${key} ${Math.round(used[key] / 1024 / 1024 * 100) / 100} MB | `; 
+                    }                
+                    this.log.info(mesg);*/
+                    time = process.hrtime(work);
+                    this.log.debug('loop main ends after ' + time + ' s');
+                }
+            } catch (error) {
+                this.errorHandler(error, 'loop: '); 
+            } finally {
+                clearTimeout(this.tout);
+                this.tout = null;
+            }
+        }            
+    }
+
+    setDeviceStates() {
+        const deviceList = this.Fb.deviceList;
+        if(this.config.compatibility == true) this.setState('devices', { val: deviceList.length, ack: true });
+        this.setState('fb-devices.count', { val: deviceList.length, ack: true });
+        let inActiveHosts = deviceList.filter(host => host.Active == '0');
+        this.setState('fb-devices.inactive', { val: inActiveHosts.length, ack: true });
+        inActiveHosts = null;
+        let activeHosts = deviceList.filter(host => host.Active == '1');
+        this.setState('fb-devices.active', { val: activeHosts.length, ack: true });
+        if(this.config.compatibility == true) this.setState('activeDevices', { val: activeHosts.length, ack: true });
+        activeHosts = null;
+    }
+    
+    async getAllFbObjects(){
+        try {
+            const items = this.Fb.deviceList;
+            if (items === null || items === false) return null;
+            // Get all fb-device objects of this adapter
+            let hosts = [];
+            let devices = await this.getDevicesAsync();
+            let fbDevices = devices.filter(x => x._id.includes(`${this.namespace}` + '.fb-devices.'));
+
             for(let i=0;i<items.length;i++){
                 let hostName = items[i]['HostName'];
-                if (hostName.includes('.')){
-                    hostName = hostName.replace('.', '-');
-                }
-                const host = devices.filter(x => x._id.replace(`${this.namespace}` + '.fb-devices.','') === hostName);
-                if (!host || host.length == 0){
+                hostName = hostName.replace(this.FORBIDDEN_CHARS, '-');
+
+                const host = fbDevices.filter(x => x._id.replace(`${this.namespace}` + '.fb-devices.','') === hostName);
+                let item = items.filter(x => x.HostName == items[i].HostName);
+                let itemActive = items.filter(x => x.HostName == items[i].HostName && x.Active == '1');
+                if (!host || host.length == 0){ //new devices
                     const device = {
                         status: 'new',
                         dp: 'fb-devices.' + hostName,
@@ -339,30 +370,110 @@ class FbCheckpresence extends utils.Adapter {
                         hnOrg: items[i]['HostName'],
                         mac: items[i]['MACAddress'],
                         ip: items[i]['IPAddress'],
-                        active: items[i]['Active'],
+                        active: items[i]['Active'] == 1 ? true : false,
                         data: items[i],
-                        interfaceType: items[i]['InterfaceT,ype'],
-                        speed: items[i]['X_AVM-DE_Speed'],
-                        guest: items[i]['X_AVM-DE_Guest']
+                        interfaceType: items[i]['InterfaceType'],
+                        speed: parseInt(items[i]['X_AVM-DE_Speed']),
+                        guest: items[i]['X_AVM-DE_Guest'] == 0 ? false : true
                     };
                     hosts.push(device);
                 }
+                if (!item || item.length == 1){
+                    const device = {
+                        status: 'unchanged',
+                        dp: 'fb-devices.' + hostName,
+                        hn: hostName,
+                        hnOrg: items[i]['HostName'],
+                        mac: items[i]['MACAddress'],
+                        ip: items[i]['IPAddress'],
+                        active: items[i]['Active'] == 1 ? true : false,
+                        data: items[i],
+                        interfaceType: items[i]['InterfaceType'],
+                        speed: parseInt(items[i]['X_AVM-DE_Speed']),
+                        guest: items[i]['X_AVM-DE_Guest'] == 0 ? false : true
+                    };
+                    hosts.push(device);
+                }
+                if (!item || item.length > 1){
+                    let mac = '';
+                    let ip = '';
+                    let active = false;
+                    for (let it = 0; it < item.length; it++){
+                        mac += mac == '' ? item[it].MACAddress : ', ' + item[it].MACAddress;
+                        ip += ip == '' ? item[it].IPAddress : ', ' + item[it].IPAddress;
+                    }
+                    if (itemActive && itemActive.length > 0) active = true;
+                    const device = {
+                        status: 'unchanged',
+                        dp: 'fb-devices.' + hostName,
+                        hn: hostName,
+                        hnOrg: items[i]['HostName'],
+                        mac: mac,
+                        ip: ip,
+                        active: active,
+                        data: active == true ? itemActive[0] : items[i],
+                        interfaceType: active == true ? itemActive[0]['InterfaceType'] : items[i]['InterfaceType'],
+                        speed: active == true ? parseInt(itemActive[0]['X_AVM-DE_Speed']) : parseInt(items[i]['X_AVM-DE_Speed']),
+                        guest: active == true ? itemActive[0]['X_AVM-DE_Guest'] == 0 ? false : true : items[i]['X_AVM-DE_Guest'] == 0 ? false : true
+                    };
+                    const temp = hosts.filter(x => x.hn == hostName);
+                    if (temp.length == 0) hosts.push(device);
+                }
+                item = null;
+                itemActive = null;
             }
-            return hosts;
+
+            for (const id in fbDevices) {
+                if (fbDevices[id] != undefined && fbDevices[id].common != undefined){
+                    const dName = fbDevices[id].common.name;
+                    const shortName = dName.replace('fb-devices.', '');
+                    const shortNameOrg = fbDevices[id].common.desc;
+                    //shortNameOrg = shortNameOrg.replace('-', '.');
+                    let host = items.filter(x => x.HostName === shortName);
+                    if (host && host.length == 0){
+                        let host = items.filter(x => x.HostName === shortNameOrg);
+                        if (host && host.length == 0){
+                            const device = {
+                                status: 'old',
+                                dp: 'fb-devices.' + shortName,
+                                hn: shortName,
+                                hnOrg: shortNameOrg,
+                                mac: '', //await this.getStateAsync('fb-devices.' + shortName + '.macaddress').val,
+                                ip: '', //await this.getStateAsync('fb-devices.' + shortName + '.ipaddress').val,
+                                active: false,
+                                data: null,
+                                interfaceType: '',
+                                speed: 0,
+                                guest: false
+                            };
+                            hosts.push(device);       
+                        }
+                        host = null;                        
+                    }
+                    host = null;
+                }
+            }
+            let newObjs = hosts.filter(host => host.status == 'new');
+            if (newObjs) await obj.createFbDeviceObjects(this, this.adapterStates, newObjs, this.enabled);
+            devices = null;
+            newObjs = null;
+            fbDevices = null;
+            this.hosts = hosts;
+            hosts = null;
+            return true;
         } catch (error) {
-            this.log.error('refreshFbObjects ' + JSON.stringify(error));
+            this.errorHandler(error, 'getAllFbObjects: '); 
             return null;
-        }
+        } 
     }
 
     async stopAdapter(){
         try {
-            //this.log.warn('Adapter stops');
             const adapterObj = await this.getForeignObjectAsync(`system.adapter.${this.namespace}`);
             adapterObj.common.enabled = false;  // Adapter ausschalten
             await this.setForeignObjectAsync(`system.adapter.${this.namespace}`, adapterObj);
         } catch (error) {
-            this.log.error('stopAdper: ' + JSON.stringify(error));            
+            this.errorHandler(error, 'stopAdapter: '); 
         }
     }
 
@@ -372,22 +483,42 @@ class FbCheckpresence extends utils.Adapter {
     async onReady() {
         try {
             // Initialize your adapter here
+            const membersFiltered = this.config.familymembers.filter(x => x.enabled == true);
+            const familyGroups = this.removeDuplicates(membersFiltered);
+
+            this.Fb = await fb.Fb.init({
+                host: this.config.ipaddress,
+                uid: this.config.username,
+                pwd: this.config.password
+            }, this.config.ssl, this);
+
+            if(this.Fb.services === null) {
+                this.log.error('Can not get services! Adapter stops');
+                this.stopAdapter();
+            }
             //Logging of adapter start
-            this.log.info('start fb-checkpresence: ip-address: "' + this.config.ipaddress + '" - interval devices: ' + this.config.interval + ' Min.' + ' - interval members: ' + this.config.intervalFamily + ' s');
-            this.log.debug('configuration user: <' + this.config.username + '>');
+            this.log.info('start ' + `${this.namespace}` + ': ' + this.Fb.modelName + ' version: ' + this.Fb.version + ' ip-address: "' + this.config.ipaddress + '" - interval devices: ' + this.config.interval + ' min.' + ' - interval members: ' + this.config.intervalFamily + ' s');
+            this.config.username === '' ? this.log.warn('please insert a user for full functionality') : this.log.debug('configuration user: <' + this.config.username + '>');
             this.log.debug('configuration history: <' + this.config.history + '>');
             this.log.debug('configuration dateformat: <' + this.config.dateformat + '>');
+            this.log.debug('configuration familymembers count: ' + membersFiltered.length);
             this.log.debug('configuration familymembers: ' + JSON.stringify(this.config.familymembers));
             this.log.debug('configuration fb-devices ' + this.config.fbdevices);
-            this.log.debug('configuratuion mesh info: ' + this.config.meshinfo);            
+            this.log.debug('configuration mesh info: ' + this.config.meshinfo);            
+            this.log.debug('configuration whitelist: ' + this.config.enableWl);            
+            this.log.debug('configuration compatibility: ' + this.config.compatibility);            
+            this.log.debug('configuration ssl: ' + this.config.ssl);            
+            this.log.debug('configuration qr code: ' + this.config.qrcode);            
+            this.log.debug('configuration guest info: ' + this.config.guestinfo);            
+            this.log.debug('configuration filter delay: ' + this.config.delay);            
 
-            //decrypt fritzbox password
-            const sysObj =  await this.getForeignObjectAsync('system.config');
-            if (sysObj && sysObj.native && sysObj.native.secret) {
-                this.config.password = this.decrypt(sysObj.native.secret, this.config.password);
-            } else {
-                this.config.password = this.decrypt('SdoeQ85NTrg1B0FtEyzf', this.config.password);
-            }
+            //this.log.info('test version: 1.1.3_g');            
+            const mesg = this.Fb.connection == null ? '-' : this.Fb.connection;
+            this.log.info('configuration default connection: ' + mesg);            
+
+            this.Fb.suportedServices.forEach(element => {
+                element.enabled ? this.log.info(element.name + ' is supported') : this.log.warn(element.name + ' is not supported! Feature is deactivated!');
+            });
 
             //Configuration changes if needed
             let adapterObj = (await this.getForeignObjectAsync(`system.adapter.${this.namespace}`));
@@ -411,93 +542,108 @@ class FbCheckpresence extends utils.Adapter {
 
             //create new configuration items -> workaround for older versions
             for(let i=0;i<this.config.familymembers.length;i++){
-                if (this.config.familymembers[i].useip == undefined) {
-                    adapterObj.native.familymembers[i].useip = false;
-                    adapterObj.native.familymembers[i].ipaddress = '';
+                if (this.config.familymembers[i].usefilter == undefined) {
+                    this.log.warn(this.config.familymembers[i].familymember + ' usefilter is undefined! Changed to false');
+                    adapterObj.native.familymembers[i].usefilter = false;
+                    adapterObjChanged = true;
+                }
+                if (this.config.familymembers[i].group == undefined) {
+                    this.log.warn(this.config.familymembers[i].familymember + ' group is undefined! Changed to ""');
+                    adapterObj.native.familymembers[i].group = '';
+                    adapterObjChanged = true;
+                }
+                if (this.config.familymembers[i].devicename == undefined) {
+                    this.log.warn(this.config.familymembers[i].familymember + ' devicename is undefined! Changed to ""');
+                    adapterObj.native.familymembers[i].devicename = '';
+                    adapterObjChanged = true;
+                }
+                if (this.config.familymembers[i].usage == undefined) {
+                    if (this.config.familymembers[i].useip == true) adapterObj.native.familymembers[i].usage = 'IP';
+                    if (this.config.familymembers[i].usename == true) adapterObj.native.familymembers[i].usage = 'Hostname';
+                    if (this.config.familymembers[i].usename == false && this.config.familymembers[i].useip == false) adapterObj.native.familymembers[i].usage = 'MAC';
+                    if (adapterObj.native.familymembers[i].usage == undefined) adapterObj.native.familymembers[i].usage = 'MAC';
+                    this.log.warn(this.config.familymembers[i].familymember + ' usage is undefined! Changed to ' + adapterObj.native.familymembers[i].usage);
                     adapterObjChanged = true;
                 }
             }
 
+            //suppress messages from family members after one occurence
+            for(let i=0;i<this.config.familymembers.length;i++){
+                if (this.config.familymembers[i].enabled === true){
+                    this.suppressArr[i] = {name: this.config.familymembers[i].familymember, suppress: false, hostname: this.config.familymembers[i].devicename, mac: this.config.familymembers[i].macaddress, ip: this.config.familymembers[i].ipaddress};
+                }
+            }
+
             if (adapterObjChanged === true){ //Save changes
+                this.log.info('some familymember attributes were changed! Please check the configuration');
+                this.log.info('Adapter restarts');
                 await this.setForeignObjectAsync(`system.adapter.${this.namespace}`, adapterObj);
             }
 
-            const cfg = {
-                ip: this.config.ipaddress,
-                port: '49000',
-                iv: this.config.interval,
-                history: this.config.history,
-                dateFormat: this.config.dateformat,
-                uid: this.config.username,
-                pwd: this.config.password,
-                members: this.config.familymembers,
-                wl: this.config.whitelist
-            };
+            const intDev = this.config.interval * 60;
+            const intFamily = this.config.intervalFamily;
             
-            const cron = cfg.iv * 60;
-            const cronFamily = this.config.intervalFamily;
-            
-            const devInfo = {
-                host: this.config.ipaddress,
-                port: '49000',
-                sslPort: null,
-                uid: this.config.username,
-                pwd: this.config.password
-            };
-
-            this.Fb = await fb.Fb.init(devInfo, this);
-            if(this.Fb.services === null) {
-                this.log.error('Can not get services! Adapter stops');
-                this.stopAdapter();
+            if(this.config.compatibility === true) {
+                this.log.warn('In an future version some states are not more existent. Please use compatibility = false to switch to the new handling of the states!');
+                this.log.warn('You should then manually delete the old states!');
             }
 
-            //Check if services/actions are supported
-            this.GETPATH = await this.Fb.chkService('X_AVM-DE_GetHostListPath', 'Hosts1', 'X_AVM-DE_GetHostListPath');
-            this.GETMESHPATH = await this.Fb.chkService('X_AVM-DE_GetMeshListPath', 'Hosts1', 'X_AVM-DE_GetMeshListPath');
-            this.GETBYMAC = await this.Fb.chkService('GetSpecificHostEntry', 'Hosts1', 'GetSpecificHostEntry');
-            this.GETBYIP = await this.Fb.chkService('X_AVM-DE_GetSpecificHostEntryByIP', 'Hosts1', 'X_AVM-DE_GetSpecificHostEntryByIP');
-            this.GETPORT = await this.Fb.chkService('GetSecurityPort', 'DeviceInfo1', 'GetSecurityPort');
-            this.GETEXTIP = await this.Fb.chkService('GetInfo', 'WANPPPConnection1', 'GetInfo');
-            if ( this.GETEXTIP == false) this.GETEXTIP = await this.Fb.chkService('GetInfo', 'WANIPConnection1', 'GetInfo');
-            this.SETENABLE = await this.Fb.chkService('SetEnable', 'WLANConfiguration3', 'SetEnable');
-            this.WLAN3INFO = await this.Fb.chkService('GetInfo', 'WLANConfiguration3', 'WLANConfiguration3-GetInfo');
-            this.DEVINFO = await this.Fb.chkService('GetInfo', 'DeviceInfo1', 'DeviceInfo1-GetInfo');
-            this.DISALLOWWANACCESSBYIP = await this.Fb.chkService('DisallowWANAccessByIP', 'X_AVM-DE_HostFilter', 'DisallowWANAccessByIP');
-            this.GETWANACCESSBYIP = await this.Fb.chkService('GetWANAccessByIP', 'X_AVM-DE_HostFilter', 'GetWANAccessByIP');
-            this.REBOOT = await this.Fb.chkService('Reboot', 'DeviceConfig1', 'Reboot');
-            
             //Create global objects
-            await obj.createGlobalObjects(this, this.HTML+this.HTML_END, this.HTML_GUEST+this.HTML_END, this.enabled);
-            await obj.createMemberObjects(this, cfg, this.HTML_HISTORY + this.HTML_END, this.enabled);
+            await obj.createGlobalObjects(this, this.adapterStates, this.HTML+this.HTML_END, this.HTML_GUEST+this.HTML_END, this.enabled);
+
+            this.Fb.suportedServices.forEach(element => {
+                this.setState('info.' + element.id, { val: element.enabled, ack: true });
+            });
+            this.setState('reboot', { val: false, ack: true });
+            this.setState('reconnect', { val: false, ack: true });
+
+            //If history is enbled, check if history adapter is running. 
+            if (this.config.history != ''){
+                this.historyAlive = await this.getForeignStateAsync('system.adapter.' + this.config.history + '.alive');
+                if (this.historyAlive.val === false){
+                    for (let to = 0; to < 6; to++){
+                        this.log.warn('history adapter is not alive! Waiting 10s');
+                        await this._sleep(10000);
+                        this.historyAlive = await this.getForeignStateAsync('system.adapter.' + this.config.history + '.alive');
+                        if (this.historyAlive.val === true) break;
+                    }
+                    if (this.historyAlive.val === false) this.stopAdapter();
+                }
+            } 
+
+            await obj.createMemberObjects(this, membersFiltered, familyGroups, this.adapterStates, this.memberStates, this.config, this.HTML_HISTORY + this.HTML_END, this.enabled, this.historyAlive.val);
 
             //create Fb devices
-            if (this.GETPATH != null && this.GETPATH == true && this.config.fbdevices == true){
-                const items = await this.Fb.getDeviceList(this, cfg, this.Fb);
-                if (items != null){
-                    const hosts = await this.getAllFbObjects(items);
-                    const res = await obj.createFbDeviceObjects(this, hosts, this.enabled);
+            if (this.Fb.GETPATH != null && this.Fb.GETPATH == true && this.config.fbdevices == true){
+                await this.Fb.getDeviceList();
+                if (this.Fb.deviceList != null){
+                    await this.getAllFbObjects();
+                    const res = await obj.createFbDeviceObjects(this, this.adapterStates, this.hosts, this.enabled);
                     if (res === true) this.log.info('createFbDeviceObjects finished successfully');
-                    //await obj.createMeshObjects(this, items, 0, this.enabled);
                 }else{
                     this.log.error('createFbDeviceObjects -> ' + "can't read devices from fritzbox! Adapter stops");
                     adapterObj = await this.getForeignObjectAsync(`system.adapter.${this.namespace}`);
                     adapterObj.common.enabled = false;  // Adapter ausschalten
                     await this.setForeignObjectAsync(`system.adapter.${this.namespace}`, adapterObj);
                 }
-                await this.resyncFbObjects(items);
+                await this.resyncFbObjects(this.Fb.deviceList);
             }
 
             // states changes inside the adapters namespace are subscribed
-            if (this.SETENABLE === true && this.WLAN3INFO === true) this.subscribeStates(`${this.namespace}` + '.guest.wlan');
-            if (this.DISALLOWWANACCESSBYIP === true && this.GETWANACCESSBYIP === true) this.subscribeStates(`${this.namespace}` + '.fb-devices.*.disabled');  
-            if (this.REBOOT === true) this.subscribeStates(`${this.namespace}` + '.reboot');  
-            this.subscribeStates(`${this.namespace}` + '.readFamilyMember'); 
+            if (this.Fb.SETENABLE === true && this.Fb.WLAN3INFO === true && this.config.guestinfo === true) this.subscribeStates(`${this.namespace}` + '.guest.wlan');
+            if (this.Fb.DISALLOWWANACCESSBYIP === true && this.Fb.GETWANACCESSBYIP === true) this.subscribeStates(`${this.namespace}` + '.fb-devices.*.disabled');  
+            if (this.Fb.REBOOT === true) this.subscribeStates(`${this.namespace}` + '.reboot');  
+            if (this.Fb.RECONNECT === true) this.subscribeStates(`${this.namespace}` + '.reconnect');  
+            this.log.info('states successfully subscribed');
 
-            this.loop(10, 55, cronFamily, cron, cfg);
+            this.loop(intFamily-1, intDev-3, intFamily, intDev); //values must be less than intFamily or intDev
+            this.log.info('loop successfully started');
         } catch (error) {
-            this.showError('onReady: ' + error);
+            this.errorHandler(error, 'onReady: ');
+            this.stopAdapter();
         }
     }
+
 
     /**
      * Is called when adapter shuts down - callback has to be called under any circumstances!
@@ -506,11 +652,11 @@ class FbCheckpresence extends utils.Adapter {
     async onUnload(callback) {
         try {
             this.enabled = false;
-            this.timeout && clearTimeout(this.timeout);
-            this.timeout = null;
-            this.Fb.exitRequest;
+            if (this.Fb != null) this.Fb.exitRequest();
+            this.tout && clearTimeout(this.tout);
+            this.setState('info.connection', { val: false, ack: true });
             this.log.info('cleaned everything up ...');
-            callback && callback();
+            setTimeout(callback, 3000);
         } catch (e) {
             this.log.error('onUnload: ' + e);
             callback && callback();
@@ -540,42 +686,65 @@ class FbCheckpresence extends utils.Adapter {
     async onStateChange(id, state) {
         try {
             if (state) {
-                if (id == `${this.namespace}` + '.guest.wlan' && this.SETENABLE == true && state.ack === false && this.WLAN3INFO ===true){
-                    this.log.info(`${id} changed: ${state.val} (ack = ${state.ack})`);
+                if (id == `${this.namespace}` + '.guest.wlan' && this.Fb.SETENABLE == true && state.ack === false && this.Fb.WLAN3INFO ===true && this.config.guestinfo === true){
+                    this.log.info(`state ${id} changed: ${state.val} (ack = ${state.ack})`);
                     const val = state.val ? '1' : '0';
-                    const guestwlan = await this.Fb.soapAction(this.Fb, '/upnp/control/wlanconfig3', this.urn + 'WLANConfiguration:3', 'SetEnable', [[1, 'NewEnable', val]]);
-                    if (guestwlan['status'] == 200 || guestwlan['result'] == true) {
-                        await this.Fb.getGuestWlan(id);
+                    const soapResult = {data: null};
+                    await this.Fb.soapAction('/upnp/control/wlanconfig3', 'urn:dslforum-org:service:' + 'WLANConfiguration:3', 'SetEnable', [[1, 'NewEnable', val]], soapResult);
+                    //if (guestwlan['status'] == 200 || guestwlan['result'] == true) {
+                    if (soapResult && soapResult.data) {
+                        await this.Fb.getGuestWlan(id, this.config.qrcode);
                         //if(state.val == wlanStatus) this.setState('guest.wlan', { val: wlanStatus, ack: true });
                     }else{
-                        throw {name: `onStateChange ${id}`, message: 'Can not change state' + JSON.stringify(guestwlan)};
+                        throw {name: `onStateChange ${id}`, message: 'Can not change state' + JSON.stringify(soapResult.data)};
                     }
                 }
 
-                if (id.includes('disabled') && state.ack === false && this.DISALLOWWANACCESSBYIP === true && this.GETWANACCESSBYIP === true){
-                    this.log.info(`${id} changed: ${state.val} (ack = ${state.ack})`);
+                if (id.includes('disabled') && state.ack === false && this.Fb.DISALLOWWANACCESSBYIP === true && this.Fb.GETWANACCESSBYIP === true){
+                    this.log.info(`state ${id} changed: ${state.val} (ack = ${state.ack})`);
                     const ipId = id.replace('.disabled', '') + '.ipaddress';
                     const ipaddress = await this.getStateAsync(ipId);
                     const val = state.val ? '1' : '0';
                     this.log.info('ip ' + JSON.stringify(ipaddress.val) + ' ' + val);
-                    const DisallowWANAccess = await this.Fb.soapAction(this.Fb, '/upnp/control/x_hostfilter', this.urn + 'X_AVM-DE_HostFilter:1', 'DisallowWANAccessByIP', [[1, 'NewIPv4Address', ipaddress.val],[2, 'NewDisallow', val]]);
-                    if (DisallowWANAccess['status'] == 200 || DisallowWANAccess['result'] == true) {
-                        await this.Fb.getWanAccess(ipaddress, id);
-                        //this.setState(id, { val: state.val, ack: true });
+                    const soapResult = {data: null};
+                    await this.Fb.soapAction('/upnp/control/x_hostfilter', 'urn:dslforum-org:service:' + 'X_AVM-DE_HostFilter:1', 'DisallowWANAccessByIP', [[1, 'NewIPv4Address', ipaddress.val],[2, 'NewDisallow', val]], soapResult);
+                    if (soapResult && soapResult.data) {
+                        const wanaccess = await this.Fb.getWanAccess(ipaddress);
+                        if (wanaccess !== null) this.setState(id, { val: wanaccess, ack: true });
                     }else{
-                        throw {name: `onStateChange ${id}`, message: 'Can not change state' + JSON.stringify(DisallowWANAccess)};
+                        throw {name: `onStateChange ${id}`, message: 'Can not change state' + JSON.stringify(soapResult.data)};
                     }
                 }
 
-                if (id == `${this.namespace}` + '.reboot' && this.REBOOT === true){
-                    this.log.info(`${id} changed: ${state.val} (ack = ${state.ack})`);
+                if (id == `${this.namespace}` + '.reboot' && this.Fb.REBOOT === true){
+                    this.log.info(`state ${id} changed: ${state.val} (ack = ${state.ack})`);
                     if (state.val === true){
-                        const reboot = await this.Fb.soapAction(this.Fb, '/upnp/control/deviceconfig', this.urn + 'DeviceConfig:1', 'Reboot', null);
-                        if (reboot['status'] == 200 || reboot['result'] == true) {
+                        const soapResult = {data: null};
+                        await this.Fb.soapAction('/upnp/control/deviceconfig', 'urn:dslforum-org:service:' + 'DeviceConfig:1', 'Reboot', null, soapResult);
+                        //if (reboot['status'] == 200 || reboot['result'] == true) {
+                        if (soapResult && soapResult.data) {
                             this.setState(`${this.namespace}` + '.reboot', { val: false, ack: true });
                         }else{
                             this.setState(`${this.namespace}` + '.reboot', { val: false, ack: true });
-                            throw('reboot failure! ' + JSON.stringify(reboot));
+                            throw Error('reboot failure! ' + JSON.stringify(soapResult.data));
+                        }
+                    }
+                }
+
+                if (id == `${this.namespace}` + '.reconnect' && this.Fb.RECONNECT === true){
+                    this.log.info(`state ${id} changed: ${state.val} (ack = ${state.ack})`);
+                    if (state.val === true){
+                        const soapResult = {data: null};
+                        if(this.Fb.RECONNECT && this.Fb.RECONNECT == true && this.Fb.connection == '1.WANPPPConnection.1'){
+                            await this.Fb.soapAction('/upnp/control/wanpppconn1', 'urn:dslforum-org:service:' + 'WANPPPConnection:1', 'ForceTermination', null, soapResult);
+                        }else{
+                            await this.Fb.soapAction('/upnp/control/wanipconnection1', 'urn:dslforum-org:service:' + 'WANIPConnection:1', 'ForceTermination', null, soapResult);
+                        }
+                        if (soapResult && soapResult.data) {
+                            this.setState(`${this.namespace}` + '.reconnect', { val: false, ack: true });
+                        }else{
+                            this.setState(`${this.namespace}` + '.reconnect', { val: false, ack: true });
+                            throw('reconnect failure! ' + JSON.stringify(soapResult));
                         }
                     }
                 }
@@ -620,7 +789,13 @@ class FbCheckpresence extends utils.Adapter {
                 this.log.debug(`state ${id} deleted`);
             }*/
         } catch (error) {
-            this.log.error('onStateChange: ' + JSON.stringify(error));            
+            if (error.message == 'DisconnectInProgress'){
+                this.setState(`${this.namespace}` + '.reconnect', { val: false, ack: true });
+                this.log.info('Fritzbox reconnect in progress');            
+                await this._sleep(5000);
+            }else{
+                this.log.error('onStateChange: ' + error.name + ' ' + error.message);            
+            }
         }
     }
 
@@ -640,7 +815,7 @@ class FbCheckpresence extends utils.Adapter {
                 }
 
                 switch (obj.command) {
-                    case 'discovery':{
+                    case 'getDevices':{
                         this.allDevices = [];
                         let onlyActive, reread;
                         if (typeof obj.message === 'object') {
@@ -654,28 +829,19 @@ class FbCheckpresence extends utils.Adapter {
                         }
                         this.allDevices.onlyActive = onlyActive;
 
-                        const devInfo = {
-                            host: this.config.ipaddress,
-                            port: '49000',
-                            sslPort: null,
-                            uid: this.config.username,
-                            pwd: this.config.password
-                        };
-                        const Fb = new fb.Fb(devInfo, this);
-
-                        let items;
-                        if (this.GETPATH == true){
-                            items =  await Fb.getDeviceList(this, null, Fb);
-                            if (items == null){
+                        if (this.Fb.GETPATH && this.Fb.GETPATH == true){
+                            await this.Fb.getDeviceList();
+                            if (this.Fb.deviceList == null){
+                                reply(this.allDevices);
                                 return;
                             }
-                            for (let i = 0; i < items.length; i++) {
-                                const active = items[i]['Active'];
+                            for (let i = 0; i < this.Fb.deviceList.length; i++) {
+                                const active = this.Fb.deviceList[i]['Active'];
                                 if (!onlyActive || active) {
                                     this.allDevices.push ({
-                                        name: items[i]['HostName'],
-                                        ip: items[i]['IPAddress'],
-                                        mac: items[i]['MACAddress'],
+                                        name: this.Fb.deviceList[i]['HostName'],
+                                        ip: this.Fb.deviceList[i]['IPAddress'],
+                                        mac: this.Fb.deviceList[i]['MACAddress'],
                                         active: active
                                     });
                                 }
@@ -695,104 +861,29 @@ class FbCheckpresence extends utils.Adapter {
         }
     }
 
-    async getDeviceInfo(hosts, mesh, cfg){
+    async getMeshInfo(){
         try {
-            //analyse guests
-            let guestCnt = 0;
-            let activeCnt = 0;
-            let inactiveCnt = 0;
-            let blCnt = 0;
-            let wlCnt = 0;
-            let htmlRow = this.HTML_GUEST;
-            let htmlBlRow = this.HTML_GUEST;
-            let htmlFbDevices = this.HTML_FB;
-            let jsonRow = '[';
-            let jsonBlRow = '[';
-            let jsonWlRow = '[';
-            let jsonFbDevices = '[';
-            let jsonFbDevActive = '[';
-            let jsonFbDevInactive = '[';
-            const enabledMeshInfo = this.config.meshinfo;
-
+            const hosts = this.hosts;
+            const mesh = this.Fb.meshList;
             if (!hosts) return false;
-            const newObjs = hosts.filter(host => host.status == 'new');
-            if (newObjs) await obj.createFbDeviceObjects(this, newObjs, this.enabled);
+            if (!mesh) return false;
+
+            const enabledMeshInfo = this.config.meshinfo;
+            const ch = await this.getChannelsOfAsync(); //get all channels
             
             if (mesh) this.setState('fb-devices.mesh', { val: JSON.stringify(mesh), ack: true });
-
-            const items = hosts.filter(host => host.status == 'unchanged' || host.status == 'new');
-            const ch = await this.getChannelsOfAsync(); //get all channels
-
             for (let i = 0; i < hosts.length; i++) {
-                if (this.enabled == false) break;
-                let deviceType = '-';
-                if (hosts[i]['data'] != null && hosts[i]['data']['X_AVM-DE_Guest'] == 1){
-                    deviceType = 'guest';
-                }
-                if (hosts[i]['active'] == 1){ // active devices
-                    jsonFbDevActive += this.createJSONTableRow(activeCnt, ['Hostname', hosts[i]['hn'], 'IP-Address', hosts[i]['ip'], 'MAC-Address', hosts[i]['mac'], 'Active', hosts[i]['active'], 'Type', deviceType]);
-                    activeCnt += 1;
-                }else{
-                    jsonFbDevInactive += this.createJSONTableRow(inactiveCnt, ['Hostname', hosts[i]['hn'], 'IP-Address', hosts[i]['ip'], 'MAC-Address', hosts[i]['mac'], 'Active', hosts[i]['active'], 'Type', deviceType]);
-                    inactiveCnt += 1;
-                }
-                if (hosts[i]['data'] != null && hosts[i]['data']['X_AVM-DE_Guest'] == 1 && hosts[i]['active'] == 1){ //active guests
-                    htmlRow += this.createHTMLTableRow([hosts[i]['hn'], hosts[i]['ip'], hosts[i]['mac']]); //guests table
-                    jsonRow += this.createJSONTableRow(guestCnt, ['Hostname', hosts[i]['hn'], 'IP-Address', hosts[i]['ip'], 'MAC-Address', hosts[i]['mac']]);
-                    this.log.debug('getDeviceInfo active guest: ' + hosts[i]['hn'] + ' ' + hosts[i]['ip'] + ' ' + hosts[i]['mac']);
-                    guestCnt += 1;
-                }
-                let foundwl = false;
-                for(let w = 0; w < cfg.wl.length; w++) {
-                    if (cfg.wl[w].white_macaddress == hosts[i]['mac']){
-                        foundwl = true;
-                        break;
-                    }
-                }
-                if (foundwl == false && hosts[i]['data'] != null && hosts[i]['data']['X_AVM-DE_Guest'] == 0){ //&& items[i]['Active'] == 1
-                    deviceType = 'blacklist';
-                    htmlBlRow += this.createHTMLTableRow([hosts[i]['hn'], hosts[i]['ip'], hosts[i]['mac']]);
-                    jsonBlRow += this.createJSONTableRow(blCnt, ['Hostname', hosts[i]['hn'], 'IP-Address', hosts[i]['ip'], 'MAC-Address', hosts[i]['mac']]);
-                    blCnt += 1;
-                } 
-                if (foundwl == true ){
-                    deviceType = 'whitelist';
-                    jsonWlRow += this.createJSONTableRow(wlCnt, ['Hostname', hosts[i]['hn'], 'IP-Address', hosts[i]['ip'], 'MAC-Address', hosts[i]['mac']]);
-                    wlCnt += 1;
-                }
-                htmlFbDevices += this.createHTMLTableRow([hosts[i]['hn'], hosts[i]['ip'], hosts[i]['mac'], hosts[i]['active'], deviceType]);
-                jsonFbDevices += this.createJSONTableRow(i, ['Hostname', hosts[i]['hn'], 'IP-Address', hosts[i]['ip'], 'MAC-Address', hosts[i]['mac'], 'Active', hosts[i]['active'], 'Type', deviceType]);
-                
-                let hostName = hosts[i]['hn'];
-                if (hostName.includes('.')){
-                    hostName = hostName.replace('.', '-');
-                }
-                this.setState('fb-devices.' + hostName + '.macaddress', { val: hosts[i]['mac'], ack: true });
-                this.setState('fb-devices.' + hostName + '.ipaddress', { val: hosts[i]['ip'], ack: true });
-                this.setState('fb-devices.' + hostName + '.active', { val: hosts[i]['active'], ack: true });
-                this.setState('fb-devices.' + hostName + '.interfacetype', { val: hosts[i]['interfaceType'], ack: true });
-                this.setState('fb-devices.' + hostName + '.speed', { val: hosts[i]['speed'], ack: true });
-                this.setState('fb-devices.' + hostName + '.guest', { val: hosts[i]['guest'], ack: true });
-                this.setState('fb-devices.' + hostName + '.whitelist', { val: foundwl, ack: true });
-                this.setState('fb-devices.' + hostName + '.blacklist', { val: ! (foundwl && hosts[i]['guest']), ack: true });
-                
-                for (let k=0; k<cfg.members.length; k++){ //speed für Family members
-                    if (cfg.members[k].macaddress == hosts[i]['mac']){
-                        this.setState(cfg.members[k].familymember + '.speed', { val: hosts[i]['speed'], ack: true });
-                        break;
-                    }
-                }
-
+                const hostName = hosts[i]['hn'];
+                //hostName = hostName.replace(this.FORBIDDEN_CHARS, '-');
                 const hostCh = ch.filter(ch => ch._id.includes('.' + hostName + '.'));
-
                 //Get mesh info for device
-                if (this.GETMESHPATH != null && this.GETMESHPATH == true && enabledMeshInfo == true){
+                if (this.Fb.GETMESHPATH != null && this.Fb.GETMESHPATH == true && enabledMeshInfo == true){
                     if (mesh != null){
                         let meshdevice = mesh.find(el => el.device_mac_address === hosts[i]['mac']);
                         if (meshdevice == null) {
                             meshdevice = mesh.find(el => el.device_name === hosts[i]['hnOrg']);
                         }
-                        if (meshdevice != null) {
+                        if (meshdevice != null) { //host in the meshlist
                             this.setState('fb-devices.' + hostName + '.meshstate', { val: true, ack: true });
                             
                             //delete old interfaces
@@ -835,14 +926,15 @@ class FbCheckpresence extends utils.Adapter {
                                 const ifNewName = ifName == '' ? ifType : ifName;
                                 let found = false;
                                 for (const c in hostCh) {
-                                    if (hostCh[c]._id.includes('.' + hostName + '.' + ifNewName)){
+                                    //if (hostCh[c]._id.includes('.' + hostName + '.' + ifNewName)){
+                                    if (hostCh[c]._id == `${this.namespace}.fb-devices.` + hostName + '.' + ifNewName){
                                         found = true;
                                         break;
                                     }
                                 }
                                 if (found == false){ //new interfaces
                                     this.log.info('New interface found: ' + hostName + '.' + ifNewName);
-                                    obj.createMeshObject(this, hostName, ifNewName, this.enabled);
+                                    await obj.createMeshObject(this, hostName, ifNewName, this.enabled);
                                 }
                             }
 
@@ -866,24 +958,22 @@ class FbCheckpresence extends utils.Adapter {
                                         if ( nodelinks['state'] == 'CONNECTED'){
                                             if (nodelinks['node_1_uid'] != meshdevice['uid']){ //Top connection
                                                 const node1 = mesh.find(el => el.uid === nodelinks['node_1_uid']);
-                                                if (link != '') link += ',';
-                                                link += node1['device_name'];
+                                                link = (link == '') ? link += node1['device_name'] : link += ',' + node1['device_name'];
                                                 const intf = node1.node_interfaces.find(el => el.uid === nodelinks['node_interface_1_uid']);
                                                 ifType += ' ' + intf['name'];
                                             }
                                             if (nodelinks['node_2_uid'] != meshdevice['uid']){ //Down connection
                                                 const node1 = mesh.find(el => el.uid === nodelinks['node_2_uid']);
-                                                if (link != '') link += ',';
-                                                link += node1['device_name'];
+                                                link = (link == '') ? link += node1['device_name'] : link += ',' + node1['device_name'];
                                             }
                                             data_rate_rx = Math.round(nodelinks['cur_data_rate_rx'] / 1000);
                                             data_rate_tx = Math.round(nodelinks['cur_data_rate_tx'] / 1000);
                                         }
-                                        this.setState('fb-devices.' + hostName + '.' + ifNewName + '.link', { val: link, ack: true });
-                                        this.setState('fb-devices.' + hostName + '.' + ifNewName + '.rx_rcpi', { val: nodelinks['rx_rcpi'], ack: true });
+                                        this.setState('fb-devices.' + hostName + '.' + ifNewName + '.rx_rcpi', { val: Math.round(nodelinks['rx_rcpi']), ack: true });
                                         this.setState('fb-devices.' + hostName + '.' + ifNewName + '.cur_data_rate_rx', { val: data_rate_rx, ack: true });
                                         this.setState('fb-devices.' + hostName + '.' + ifNewName + '.cur_data_rate_tx', { val: data_rate_tx, ack: true });
                                     }
+                                    this.setState('fb-devices.' + hostName + '.' + ifNewName + '.link', { val: link, ack: true });
                                 }else{
                                     //Interface without links
                                     this.setState('fb-devices.' + hostName + '.' + ifNewName + '.link', { val: '', ack: true });
@@ -893,9 +983,10 @@ class FbCheckpresence extends utils.Adapter {
                                 }
                                 this.setState('fb-devices.' + hostName + '.' + ifNewName + '.type', { val: ifType, ack: true });
                             }
-                        }else{
+                        }else{ //host not in meshlist
                             for (const c in hostCh) {
                                 this.log.debug('Host not in mesh list: ' + hostCh[c]._id);
+                                //delete channel with number
                                 if (Number.isInteger(parseInt(hostCh[c]._id.replace(`${this.namespace}.fb-devices.` + hostName + '.', '')))){
                                     const states = await this.getStatesAsync(hostCh[c]._id + '.*');
                                     if (states){                                
@@ -905,63 +996,193 @@ class FbCheckpresence extends utils.Adapter {
                                         }
                                     }
                                     await this.delObjectAsync(hostCh[c]._id);
-                                }else{
+                                }else{ //old channel 
+                                    //this.log.info('test1');
                                     this.setState('fb-devices.' + hostName + '.meshstate', { val: false, ack: true });
                                     this.setState(hostCh[c]._id + '.cur_data_rate_rx', { val: 0, ack: true });
                                     this.setState(hostCh[c]._id + '.cur_data_rate_tx', { val: 0, ack: true });
                                     this.setState(hostCh[c]._id + '.rx_rcpi', { val: 0, ack: true });
                                     this.setState(hostCh[c]._id + '.link', { val: '', ack: true });
+                                    //this.log.info('test2');
                                 }
                             }
-
                         }
+                        meshdevice = null;
                     }
                 }
             }
-            jsonRow += ']';
-            jsonBlRow += ']';
+        } catch (error) {
+            this.log.error('getMeshInfo: ' + error.message);
+            return false;
+        }
+    }
+
+    async getWlBlInfo(){
+        try {
+            const hosts = this.hosts;
+            const items = this.Fb.deviceList;
+            let wlCnt = 0;
+            let blCnt = 0;
+            let jsonWlRow = '[';
+            let htmlWlRow = this.HTML_GUEST;
+            let jsonBlRow = '[';
+            let htmlBlRow = this.HTML_GUEST;
+
+            for (let i = 0; i < items.length; i++) {
+                if (this.enabled == false) break;
+                //let deviceType = '-';
+                const wl = this.config.whitelist.filter(x => x.white_macaddress == items[i]['MACAddress']);
+                const wlFound = wl.length > 0 ? true : false;
+                if (wlFound == false && items[i] != null){ //blacklist
+                    //deviceType = 'blacklist';
+                    if (items[i]['X_AVM-DE_Guest'] == false){
+                        htmlBlRow += this.createHTMLTableRow([items[i]['HostName'], items[i]['IPAddress'], items[i]['MACAddress']]);
+                        jsonBlRow += this.createJSONTableRow(blCnt, ['Hostname', items[i]['HostName'], 'IP-Address', items[i]['IPAddress'], 'MAC-Address', items[i]['MACAddress']]);
+                        blCnt += 1;
+                    }
+                } 
+                if (wlFound == true ){
+                    //deviceType = 'whitelist';
+                    htmlWlRow += this.createHTMLTableRow([items[i]['HostName'], items[i]['IPAddress'], items[i]['MACAddress']]);
+                    jsonWlRow += this.createJSONTableRow(wlCnt, ['Hostname', items[i]['HostName'], 'IP-Address', items[i]['IPAddress'], 'MAC-Address', items[i]['MACAddress']]);
+                    wlCnt += 1;
+                }
+                
+                const host = hosts.filter(x => x.hnOrg == items[i]['HostName']); //find fb-device
+                if (host && host.length > 0) {
+                    const macs = host[0].mac.split(', ');
+                    let count = 0;
+                    for (let m = 0; m < macs.length; m++){
+                        const wldevice = this.config.whitelist.filter(x => x.white_macaddress == macs[m]);
+                        if (wldevice && wldevice.length > 0) count++; 
+                    }
+                    let hostName = items[i]['HostName'];
+                    hostName = hostName.replace(this.FORBIDDEN_CHARS, '-');
+                    
+                    if (count == macs.length){
+                        this.setState('fb-devices.' + hostName + '.whitelist', { val: true, ack: true });
+                        this.setState('fb-devices.' + hostName + '.blacklist', { val: false, ack: true });               
+                    }else{
+                        this.setState('fb-devices.' + hostName + '.whitelist', { val: false, ack: true });
+                        if (host[0]['guest'] == false){
+                            this.setState('fb-devices.' + hostName + '.blacklist', { val: true, ack: true });
+                        }               
+                    }
+                }
+            }                
             jsonWlRow += ']';
-            htmlRow += this.HTML_END;
+            jsonBlRow += ']';
             htmlBlRow += this.HTML_END;
-            htmlFbDevices += this.HTML_END;
-            jsonFbDevices += ']';
-            jsonFbDevActive += ']';
-            jsonFbDevInactive += ']';
-            
-            this.setState('fb-devices.count', { val: items.length, ack: true });
-            this.setState('fb-devices.json', { val: jsonFbDevices, ack: true });
-            this.setState('fb-devices.jsonActive', { val: jsonFbDevActive, ack: true });
-            this.setState('fb-devices.jsonInactive', { val: jsonFbDevInactive, ack: true });
-            this.setState('fb-devices.html', { val: htmlFbDevices, ack: true });
-            this.setState('fb-devices.active', { val: activeCnt, ack: true });
-            this.setState('fb-devices.inactive', { val: inactiveCnt, ack: true });
-
-            this.setState('guest.listHtml', { val: htmlRow, ack: true });
-            this.setState('guest.listJson', { val: jsonRow, ack: true });
-            this.setState('guest.count', { val: guestCnt, ack: true });
-            this.setState('guest.presence', { val: guestCnt == 0 ? false : true, ack: true });
-
-            this.setState('activeDevices', { val: activeCnt, ack: true });
-
+            htmlWlRow += this.HTML_END;
             this.setState('blacklist.count', { val: blCnt, ack: true });
             this.setState('blacklist.listHtml', { val: htmlBlRow, ack: true });
             this.setState('blacklist.listJson', { val: jsonBlRow, ack: true });
             
             this.setState('whitelist.json', { val: jsonWlRow, ack: true });
-            this.setState('whitelist.count', { val: cfg.wl.length, ack: true });
-
-            if (guestCnt > 0) {
-                this.setState('guest', { val: true, ack: true });
+            this.setState('whitelist.html', { val: htmlWlRow, ack: true });
+            this.setState('whitelist.count', { val: this.config.whitelist.length, ack: true });
+            if (blCnt > 0) {
+                if(this.config.compatibility == true) this.setState('blacklist', { val: true, ack: true });
+                this.setStateChangedAsync('blacklist.presence', { val: true, ack: true });
             }else {
-                this.setState('guest', { val: false, ack: true });
+                if(this.config.compatibility == true) this.setState('blacklist', { val: false, ack: true });
+                this.setStateChangedAsync('blacklist.presence', { val: false, ack: true });
+            }
+            this.log.debug('getWlBlInfo blCnt: '+ blCnt);
+            jsonWlRow = null;
+            jsonBlRow = null;
+            htmlBlRow = null;
+            htmlWlRow = null;
+            return true;
+        } catch (error) {
+            this.log.error('getWlBlInfo: ' + error);
+            return false;            
+        }
+    }
+
+    async getDeviceInfo(){
+        try {
+            const hosts = this.hosts;
+            //analyse guests
+            let guestCnt = 0;
+            let guests = '';
+            let activeCnt = 0;
+            let inactiveCnt = 0;
+            let htmlRow = this.HTML_GUEST;
+            let htmlFbDevices = this.HTML_FB;
+            let jsonRow = '[';
+            let jsonFbDevices = '[';
+            let jsonFbDevActive = '[';
+            let jsonFbDevInactive = '[';
+
+            if (!hosts) return false;
+            
+            //const items = hosts.filter(host => host.status == 'unchanged' || host.status == 'new');
+            for (let i = 0; i < hosts.length; i++) {
+                if (this.enabled == false) break;
+                let deviceType = '-';
+                if (hosts[i]['data'] != null && hosts[i]['data']['X_AVM-DE_Guest'] == 1){
+                    deviceType = 'guest';
+                }
+                if (hosts[i]['active'] == 1){ // active devices
+                    jsonFbDevActive += this.createJSONTableRow(activeCnt, ['Hostname', hosts[i]['hn'], 'IP-Address', hosts[i]['ip'], 'MAC-Address', hosts[i]['mac'], 'Active', hosts[i]['active'], 'Type', deviceType]);
+                    activeCnt += 1;
+                }else{
+                    jsonFbDevInactive += this.createJSONTableRow(inactiveCnt, ['Hostname', hosts[i]['hn'], 'IP-Address', hosts[i]['ip'], 'MAC-Address', hosts[i]['mac'], 'Active', hosts[i]['active'], 'Type', deviceType]);
+                    inactiveCnt += 1;
+                }
+                if (hosts[i]['data'] != null && hosts[i]['data']['X_AVM-DE_Guest'] == 1 && hosts[i]['active'] == 1){ //active guests
+                    htmlRow += this.createHTMLTableRow([hosts[i]['hn'], hosts[i]['ip'], hosts[i]['mac']]); //guests table
+                    jsonRow += this.createJSONTableRow(guestCnt, ['Hostname', hosts[i]['hn'], 'IP-Address', hosts[i]['ip'], 'MAC-Address', hosts[i]['mac']]);
+                    guests += guests == '' ? hosts[i]['hn'] : ', ' + hosts[i]['hn'];
+                    this.log.debug('getDeviceInfo active guest: ' + hosts[i]['hn'] + ' ' + hosts[i]['ip'] + ' ' + hosts[i]['mac']);
+                    guestCnt += 1;
+                }
+                htmlFbDevices += this.createHTMLTableRow([hosts[i]['hn'], hosts[i]['ip'], hosts[i]['mac'], hosts[i]['active'], deviceType]);
+                jsonFbDevices += this.createJSONTableRow(i, ['Hostname', hosts[i]['hn'], 'IP-Address', hosts[i]['ip'], 'MAC-Address', hosts[i]['mac'], 'Active', hosts[i]['active'], 'Type', deviceType]);
+                
+                const hostName = hosts[i]['hn'];
+                //if (hostName.includes('MyFRITZ!App')) this.log.info('hostname: ' + hostName + ' ' + hosts[i].active);
+                //hostName = hostName.replace(this.FORBIDDEN_CHARS, '-');
+                const mac = hosts[i]['mac'] != undefined ? hosts[i]['mac'] : '';
+                const ip = hosts[i]['ip'] != undefined ? hosts[i]['ip'] : '';
+                if (hostName != '') { 
+                    this.setState('fb-devices.' + hostName + '.macaddress', { val: mac, ack: true });
+                    this.setState('fb-devices.' + hostName + '.ipaddress', { val: ip, ack: true });
+                    this.setState('fb-devices.' + hostName + '.active', { val: hosts[i]['active'], ack: true });
+                    this.setState('fb-devices.' + hostName + '.interfacetype', { val: hosts[i]['interfaceType'], ack: true });
+                    this.setState('fb-devices.' + hostName + '.speed', { val: parseInt(hosts[i]['speed']), ack: true });
+                    this.setState('fb-devices.' + hostName + '.guest', { val: hosts[i]['guest'], ack: true });
+                    if (hosts[i]['data'] != null) this.setState('fb-devices.' + hostName + '.disabled', { val: hosts[i]['data']['X_AVM-DE_Disallow'] == 0 ? false : true, ack: true });
+                }else{
+                    this.log.debug('getDeviceInfo: hostname is empty -> mac: ' + mac);
+                }
+            }
+            jsonRow += ']';
+            htmlRow += this.HTML_END;
+            htmlFbDevices += this.HTML_END;
+            jsonFbDevices += ']';
+            jsonFbDevActive += ']';
+            jsonFbDevInactive += ']';
+            
+            //this.setState('fb-devices.count', { val: items.length, ack: true });
+            this.setState('fb-devices.json', { val: jsonFbDevices, ack: true });
+            this.setState('fb-devices.jsonActive', { val: jsonFbDevActive, ack: true });
+            this.setState('fb-devices.jsonInactive', { val: jsonFbDevInactive, ack: true });
+            this.setState('fb-devices.html', { val: htmlFbDevices, ack: true });
+            //this.setState('fb-devices.active', { val: activeCnt, ack: true });
+            //this.setState('fb-devices.inactive', { val: inactiveCnt, ack: true });
+
+            if (this.config.guestinfo == true) {
+                this.setState('guest.listHtml', { val: htmlRow, ack: true });
+                this.setState('guest.listJson', { val: jsonRow, ack: true });
+                this.setState('guest.presentGuests', { val: guests, ack: true });
+                this.setState('guest.count', { val: guestCnt, ack: true });
+                const val = guestCnt > 0 ? true : false;
+                this.setStateChangedAsync('guest.presence', { val: val, ack: true });
+                if(this.config.compatibility == true) this.setState('guest', { val: val, ack: true });
             }
             this.log.debug('getDeviceInfo activeCnt: '+ activeCnt);
-            if (blCnt > 0) {
-                this.setState('blacklist', { val: true, ack: true });
-            }else {
-                this.setState('blacklist', { val: false, ack: true });
-            }
-            this.log.debug('getDeviceInfo blCnt: '+ blCnt);
             return true;
         } catch (error) {
             this.log.error('getDeviceInfo: ' + error);
@@ -969,137 +1190,197 @@ class FbCheckpresence extends utils.Adapter {
         }
     }
 
-    async getActive(index, cfg, memberRow, dnow, presence){
+    async getActive(memberRow){
+        const member = memberRow.familymember; 
         try {
-            //if (enabled === false) return null;
-            const member = memberRow.familymember; 
-            const mac = memberRow.macaddress; 
-            const ip = memberRow.ipaddress; 
-            if (memberRow.useip == undefined || ip == undefined){
-                throw('Please edit configuration in admin view and save it! Some items (use ip, ip-address) are missing'); 
+            const hosts = this.hosts;      
+            //const memberPath = memberRow.group == '' ? member : 'familyMembers.' + memberRow.group + '.' + member; 
+            const mac = memberRow.macaddress;
+            const ip = memberRow.ipaddress;
+            const deviceName = memberRow.devicename;
+            let active = null;
+            let host = null;
+            let mesg = this.suppressArr.filter(function(x){
+                if (x.name ===  memberRow.familymember && x.mac === memberRow.macaddress && x.ip === memberRow.ipaddress && x.hostname === memberRow.devicename){
+                    return x;
+                }
+            });
+            if(this.Fb.GETPATH === true){
+                if (hosts === null) return null;
+                switch (memberRow.usage) {
+                    case 'MAC':
+                        if (mac != ''){
+                            //host = hosts.filter(x => x.mac == mac);
+                            host = hosts.filter(x => x.mac.includes(mac) === true);
+                            if (host && host.length > 0){
+                                active = host[0].active;
+                                //this.log.info('getActive ' + host[0].hn + ' ' + host[0].mac + ' ' + host[0].active);
+                            }else{
+                                //if (this.suppressMesg == false){
+                                if (mesg[0].suppress === false){
+                                    mesg = this.suppressArr.filter(function(x){
+                                        if (x.name ===  memberRow.familymember && x.mac === memberRow.macaddress && x.ipaddress === memberRow.ip && x.hostname === memberRow.devicename){
+                                            x.suppress = true;
+                                            return x;
+                                        }
+                                    });
+                                    //this.suppressMesg = true;
+                                    throw new Warn('The configured mac-address for member ' + member + ' was not found in the fritzbox. Please insert a valid mac-address!');
+                                }
+                            }
+                        }else{
+                            //if (this.suppressMesg == false){
+                            if (mesg[0].suppress === false){
+                                mesg = this.suppressArr.filter(function(x){
+                                    if (x.name ===  memberRow.familymember && x.mac === memberRow.macaddress && x.ip === memberRow.ipaddress && x.hostname === memberRow.devicename){
+                                        x.suppress = true;
+                                        return x;
+                                    }
+                                });
+                                //this.suppressMesg = true;
+                                throw new Warn('The configured mac-address for member ' + member + ' is empty. Please insert a valid mac-address!');
+                            }
+                        }
+                        break;
+                    case 'IP':
+                        if (ip != ''){
+                            //host = hosts.filter(x => x.ip == ip);
+                            host = hosts.filter(x => x.ip.includes(ip) === true);
+                            if (host && host.length > 0){
+                                active = host[0].active; 
+                                //this.log.info('getActive ' + host[0].hn + ' ' + host[0].ip + ' ' + host[0].active);
+                            }else{
+                                //if (this.suppressMesg == false){
+                                if (mesg[0].suppress === false){
+                                    mesg = this.suppressArr.filter(function(x){
+                                        if (x.name ===  memberRow.familymember && x.mac === memberRow.macaddress && x.ip === memberRow.ipaddress && x.hostname === memberRow.devicename){
+                                            x.suppress = true;
+                                            return x;
+                                        }
+                                    });
+                                    //this.suppressMesg = true;
+                                    throw new Warn('The configured mac-address for member ' + member + ' was not found in the fritzbox. Please insert a valid mac-address!');
+                                }
+                            }
+                        }else{
+                            //if (this.suppressMesg == false){
+                            if (mesg[0].suppress === false){
+                                mesg = this.suppressArr.filter(function(x){
+                                    if (x.name ===  memberRow.familymember && x.mac === memberRow.macaddress && x.ip === memberRow.ipaddress && x.hostname === memberRow.devicename){
+                                        x.suppress = true;
+                                        return x;
+                                    }
+                                });
+                                //this.suppressMesg = true;
+                                throw new Warn('The configured ip-address for ' + member + ' is empty. Please insert a valid ip-address!');
+                            }
+                        }
+                        break;
+                    case 'Hostname':
+                        if (deviceName != ''){
+                            host = hosts.filter(x => x.hn == deviceName);
+                            if (host && host.length > 0){
+                                active = host[0].active; 
+                                //this.log.info('getActive ' + host[0].hn + ' ' + host[0].mac + ' ' + host[0].active);
+                            }else{
+                                //if (this.suppressMesg == false){
+                                if (mesg[0].suppress === false){
+                                    mesg = this.suppressArr.filter(function(x){
+                                        if (x.name ===  memberRow.familymember && x.mac === memberRow.macaddress && x.ip === memberRow.ipaddress && x.hostname === memberRow.devicename){
+                                            x.suppress = true;
+                                            return x;
+                                        }
+                                    });
+                                    //this.suppressMesg = true;
+                                    throw Error('The configured hostname for member ' + member + ' was not found in the fritzbox. Please insert a valid hostname!');
+                                }
+                            }
+                        }else{
+                            //if (this.suppressMesg == false){
+                            if (mesg[0].suppress === false){
+                                mesg = this.suppressArr.filter(function(x){
+                                    if (x.name ===  memberRow.familymember && x.mac === memberRow.macaddress && x.ip === memberRow.ipaddress && x.hostname === memberRow.devicename){
+                                        x.suppress = true;
+                                        return x;
+                                    }
+                                });
+                                //this.suppressMesg = true;
+                                throw Error('The configured hostname for ' + member + ' is empty. Please insert a valid hostname!');
+                            }
+                        }
+                        break;            
+                    default:
+                        break;
+                }
             }else{
-                let hostEntry = null;
-                if (memberRow.useip == false){
-                    if (mac != ''){
-                        hostEntry = await this.Fb.soapAction(this.Fb, '/upnp/control/hosts', this.urn + 'Hosts:1', 'GetSpecificHostEntry', [[1, 'NewMACAddress', memberRow.macaddress]], true);
-                    }else{
-                        throw('The configured mac-address for member ' + member + ' is empty. Please insert a valid mac-address!');
-                    }
-                }else{
-                    if (this.GETBYIP == true && ip != ''){
-                        hostEntry = await this.Fb.soapAction(this.Fb, '/upnp/control/hosts', this.urn + 'Hosts:1', 'X_AVM-DE_GetSpecificHostEntryByIP', [[1, 'NewIPAddress', memberRow.ipaddress]], true);
-                    }else{
-                        if (memberRow.ipaddress == '') {
-                            throw('The configured ip-address for ' + member + ' is empty. Please insert a valid ip-address!');
-                        }
-                    }
-                }
-                if(this.enabled == false) {
-                    return presence;
-                } 
-                if(hostEntry && hostEntry.result === false){
-                    if (hostEntry[0].errorMsg.errorDescription == 'NoSuchEntryInArray'){
-                        throw('mac or ipaddress from member ' + member + ' not found in fritzbox device list');
-                    } else if (hostEntry[0].errorMsg.errorDescription == 'Invalid Args'){
-                        throw('invalid arguments for member ' + member);
-                    } else {
-                        throw('member ' + member + ': ' + hostEntry.errorMsg.errorDescription);
-                    }
-                }
-                if (hostEntry && hostEntry.result == true && hostEntry.resultData){
-                    const newActive = hostEntry.resultData['NewActive'] == 1 ? true : false;
-                    //let memberActive = false; 
-                    let comming = null;
-                    let going = null;
-                    const curVal = await this.getStateAsync(member + '.presence'); //.then(function(curVal){ //actual member state
-                    if (curVal && curVal.val != null){
-                        //calculation of '.since'
-                        const diff = Math.round((dnow - new Date(curVal.lc))/1000/60);
-                        if (curVal.val == true){
-                            this.setState(member + '.present.since', { val: diff, ack: true });
-                            this.setState(member + '.absent.since', { val: 0, ack: true });
-                        }
-                        if (curVal.val == false){
-                            this.setState(member + '.absent.since', { val: diff, ack: true });
-                            this.setState(member + '.present.since', { val: 0, ack: true });
-                        }
-                        //analyse member presence
-                        if (newActive == true){ //member = true
-                            //memberActive = true;
-                            presence.one = true;
-                            presence.allAbsence = false;
-                            if (presence.presentMembers == '') {
-                                presence.presentMembers += member;
-                            }else{
-                                presence.presentMembers += ', ' + member;
+                switch (memberRow.usage) {
+                    case 'MAC':
+                        if (mac != ''){
+                            const soapResult = {data: null};
+                            await this.Fb.soapAction('/upnp/control/hosts', 'urn:dslforum-org:service:' + 'Hosts:1', 'GetSpecificHostEntry', [[1, 'NewMACAddress', memberRow.macaddress]], soapResult);
+                            if(soapResult && soapResult.data) {
+                                active = soapResult.data['NewActive'] == 1 ? true : false;
                             }
-                            if (curVal.val == false){ //signal changing to true
-                                this.log.info('newActive ' + member + ' ' + newActive);
-                                this.setState(member, { val: true, ack: true });
-                                this.setState(member + '.presence', { val: true, ack: true });
-                                this.setState(member + '.comming', { val: dnow, ack: true });
-                                comming = dnow;
-                            }
-                            if (curVal.val == null){
-                                this.log.warn('Member value is null! Value set to true');
-                                this.setState(member, { val: true, ack: true });
-                                this.setState(member + '.presence', { val: true, ack: true });
-                            }
-                        }else{ //member = false
-                            presence.all = false;
-                            presence.oneAbsence = true;
-                            if (presence.absentMembers == '') {
-                                presence.absentMembers += member;
-                            }else{
-                                presence.absentMembers += ', ' + member;
-                            }
-                            if (curVal.val == true){ //signal changing to false
-                                this.log.info('newActive ' + member + ' ' + newActive);
-                                this.setState(member, { val: false, ack: true });
-                                this.setState(member + '.presence', { val: false, ack: true });
-                                this.setState(member + '.going', { val: dnow, ack: true });
-                                going = dnow;
-                            }
-                            if (curVal.val == null){
-                                this.log.warn('Member value is null! Value set to false');
-                                this.setState(member, { val: false, ack: true });
-                                this.setState(member + '.presence', { val: false, ack: true });
+                        }else{
+                            if (mesg[0].suppress === false){
+                                mesg = this.suppressArr.filter(function(x){
+                                    if (x.name ===  memberRow.familymember && x.mac === memberRow.macaddress && x.ip === memberRow.ipaddress && x.hostname === memberRow.devicename){
+                                        x.suppress = true;
+                                        return x;
+                                    }
+                                });
+                                throw Warn('The configured mac-address for member ' + member + ' is empty. Please insert a valid mac-address!');
                             }
                         }
-                        this.setState(member, { val: newActive, ack: true });
-                        this.setState(member + '.presence', { val: newActive, ack: true });
-                        presence.val = newActive;
-                        const comming1 = await this.getStateAsync(member + '.comming');
-                        comming = comming1.val;
-                        const going1 = await this.getStateAsync(member + '.going');
-                        going = going1.val;
-                        if (comming1.val == null) {
-                            comming = new Date(curVal.lc);
-                            this.setState(member + '.comming', { val: comming, ack: true });
+                        break;
+                    case 'IP':
+                        if (this.Fb.GETBYIP == true && ip != ''){
+                            const soapResult = {data: null};
+                            await this.Fb.soapAction('/upnp/control/hosts', 'urn:dslforum-org:service:' + 'Hosts:1', 'X_AVM-DE_GetSpecificHostEntryByIP', [[1, 'NewIPAddress', memberRow.ipaddress]], soapResult);
+                            if(soapResult && soapResult.data) active = soapResult.data['NewActive'] == 1 ? true : false;
+                        }else{
+                            if (memberRow.ipaddress == '') {
+                                if (mesg[0].suppress === false){
+                                    mesg = this.suppressArr.filter(function(x){
+                                        if (x.name ===  memberRow.familymember && x.mac === memberRow.macaddress && x.ip === memberRow.ipaddress && x.hostname === memberRow.devicename){
+                                            x.suppress = true;
+                                            return x;
+                                        }
+                                    });
+                                    throw Error('The configured ip-address for ' + member + ' is empty. Please insert a valid ip-address!');
+                                }
+                            }
                         }
-                        if (going1.val == null) {
-                            going = new Date(curVal.lc);
-                            this.setState(member + '.going', { val: going, ack: true });
+                        break;
+                    case 'Hostname':
+                        //if (this.suppressMesg == false){
+                        if (mesg[0].suppress === false){
+                            mesg = this.suppressArr.filter(function(x){
+                                if (x.name ===  memberRow.familymember && x.mac === memberRow.macaddress && x.ip === memberRow.ipaddress && x.hostname === memberRow.devicename){
+                                    x.suppress = true;
+                                    return x;
+                                }
+                            });
+                            //this.suppressMesg = true;
+                            throw Error('The feature hostname is not supported for ' + member + '!');
                         }
-                        this.jsonTab += this.createJSONTableRow(index, ['Name', member, 'Active', newActive, 'Kommt', dateFormat(comming, cfg.dateFormat), 'Geht', dateFormat(going, cfg.dateFormat)]);
-                        this.htmlTab += this.createHTMLTableRow([member, (newActive ? '<div class="mdui-green-bg mdui-state mdui-card">anwesend</div>' : '<div class="mdui-red-bg mdui-state mdui-card">abwesend</div>'), dateFormat(comming, cfg.dateFormat), dateFormat(going, cfg.dateFormat)]);
-                        //this.log.info('getActive ' + member + ' finished');
-                        return presence;
-                    }else{
-                        throw('object ' + member + ' does not exist!');
-                    }
+                        break;
+                    default:
+                        break;
                 }
             }
+            return active;
         } catch(error){
-            this.log.error('getActive: ' + JSON.stringify(error));
+            this.errorHandler(error, 'getActive ' + member + ': ');
             return null;
         }
     }
 
-    getHistoryTable(gthis, cfg, memb, start, end){
+    getHistoryTable(gthis, memb, memberPath, start, end){
+        const cfg = this.config.history;
         return new Promise((resolve, reject) => {
-            gthis.sendTo(cfg.history, 'getHistory', {
-                id: `${gthis.namespace}` + '.' + memb,
+            gthis.sendTo(cfg, 'getHistory', {
+                id: `${gthis.namespace}` + '.' + memberPath,
                 options:{
                     end:        end,
                     start:      start,
@@ -1108,12 +1389,12 @@ class FbCheckpresence extends utils.Adapter {
                 }
             }, function (result1) {
                 if (result1 == null) {
-                    reject ('can not read history from ' + memb + ' ' + result1.error);
+                    reject (Error('can not read history from ' + memb + ' ' + result1.error));
                 }else{
                     const cntActualDay = result1.result.length;
                     gthis.log.debug('history cntActualDay: ' + cntActualDay);
-                    gthis.sendTo(cfg.history, 'getHistory', {
-                        id: `${gthis.namespace}` + '.' + memb,
+                    gthis.sendTo(cfg, 'getHistory', {
+                        id: `${gthis.namespace}` + '.' + memberPath,
                         options: {
                             end:        end,
                             count:      cntActualDay+1,
@@ -1122,7 +1403,7 @@ class FbCheckpresence extends utils.Adapter {
                         }
                     }, function (result) {
                         if (result == null) {
-                            reject('can not read history from ' + memb + ' ' + result.error);
+                            reject (Error('can not read history from ' + memb + ' ' + result.error));
                         }else{
                             resolve(result);
                         }
@@ -1132,155 +1413,493 @@ class FbCheckpresence extends utils.Adapter {
         });
     }
 
-    async checkPresence(cfg){
+    async calcMemberAttributes(memberRow, index, newActive, dnow, presence){
         try {
+            const member = memberRow.familymember;
+            let memberPath = '';
+            let historyPath = '';
+            let dPoint = null;
+            if (this.config.compatibility === true){
+                memberPath = memberRow.group == '' ? member : 'familyMembers.' + memberRow.group + '.' + member;
+                historyPath = memberRow.group == '' ? member : 'familyMembers.' + memberRow.group + '.' + member + '.presence';
+                if (memberRow.group == ''){
+                    dPoint = await this.getObjectAsync(`${this.namespace}` + '.' + memberPath);
+                }else{
+                    dPoint = await this.getObjectAsync(`${this.namespace}` + '.' + memberPath + '.presence');
+                }
+            } else {
+                memberPath = memberRow.group == '' ? 'familyMembers.' + member : 'familyMembers.' + memberRow.group + '.' + member; 
+                dPoint = await this.getObjectAsync(`${this.namespace}` + '.' + memberPath + '.presence');
+                historyPath = memberRow.group == '' ? 'familyMembers.' + member + '.presence' : 'familyMembers.' + memberRow.group + '.' + member + '.presence';
+            }
+
             const midnight = new Date(); //Date of day change 
             midnight.setHours(0,0,0);
-            const dnow = new Date(); //Actual date and time for comparison
+            
+            //let memberActive = false; 
+            let comming = null;
+            let going = null;
+            const curVal = await this.getStateAsync(memberPath + '.presence');
+            if (curVal && curVal.val == null) curVal.val = false; 
+            if (curVal && curVal.val != null){
+                //calculation of '.since'
+                const diff = Math.round((dnow - new Date(curVal.lc))/1000/60);
+                if (curVal.val == true){
+                    this.setState(memberPath + '.present.since', { val: diff, ack: true });
+                    this.setState(memberPath + '.absent.since', { val: 0, ack: true });
+                }
+                if (curVal.val == false){
+                    this.setState(memberPath + '.absent.since', { val: diff, ack: true });
+                    this.setState(memberPath + '.present.since', { val: 0, ack: true });
+                }
+                //analyse member presence
+                
+                this.setStateChangedAsync(memberPath + '.presence', { val: newActive, ack: true });
+                //this.setStateIfNotEqual(memberPath + '.presence', { val: newActive, ack: true });
+                if ( memberRow.group== '' && this.config.compatibility === true) this.setStateChangedAsync(memberPath, { val: newActive, ack: true });
+                //if ( memberRow.group== '' && this.config.compatibility === true) this.setStateIfNotEqual(memberPath, { val: newActive, ack: true });
 
-            // functions for family members
-            this.jsonTab = '[';
-            this.htmlTab = this.HTML;
-
-            let count = 0;
-            let length = cfg.members.length; //Correction if not all members enabled
-            for (let k = 0; k < cfg.members.length; k++){
-                if (cfg.members[k].enabled == false) length--;
+                if (newActive == true){ //member = true
+                    //memberActive = true;
+                    presence.one = true;
+                    presence.allAbsence = false;
+                    presence.presentCount += 1;
+                    if (presence.presentMembers == '') {
+                        presence.presentMembers += member;
+                    }else{
+                        presence.presentMembers += ', ' + member;
+                    }
+                    if (curVal.val == false){ //signal changing to true
+                        this.log.info('newActive ' + member + ' ' + newActive);
+                        this.setState(memberPath + '.comming', { val: dnow.toString(), ack: true });
+                        comming = dnow;
+                    }
+                    if (curVal.val == null){
+                        this.log.warn('Member value is null! Value set to true');
+                        if (memberPath.group == '' && this.config.compatibility === true) this.setState(memberPath, { val: true, ack: true });
+                        this.setStateChangedAsync(memberPath + '.presence', { val: true, ack: true });
+                    }
+                }else{ //member = false
+                    presence.all = false;
+                    presence.oneAbsence = true;
+                    presence.absentCount += 1;
+                    if (presence.absentMembers == '') {
+                        presence.absentMembers += member;
+                    }else{
+                        presence.absentMembers += ', ' + member;
+                    }
+                    if (curVal.val == true){ //signal changing to false
+                        this.log.info('newActive ' + member + ' ' + newActive);
+                        this.setState(memberPath + '.going', { val: dnow.toString(), ack: true });
+                        going = dnow;
+                    }
+                    if (curVal.val == null){
+                        this.log.warn('Member value is null! Value set to false');
+                        if (memberPath.group == '' && this.config.compatibility === true) this.setState(memberPath, { val: false, ack: true });
+                        this.setStateChangedAsync(memberPath + '.presence', { val: false, ack: true });
+                    }
+                }
+                presence.val = newActive;
+                const comming1 = await this.getStateAsync(memberPath + '.comming');
+                comming = comming !== null ? comming.toString() : comming1.val;
+                const going1 = await this.getStateAsync(memberPath + '.going');
+                going = going !== null ? going.toString() : going1.val;
+                if (comming1.val == null) {
+                    comming = new Date(curVal.lc);
+                    this.setState(memberPath + '.comming', { val: comming.toString(), ack: true });
+                }
+                if (going1.val == null) {
+                    going = new Date(curVal.lc);
+                    this.setState(memberPath + '.going', { val: going.toString(), ack: true });
+                }
+                this.jsonTab += this.createJSONTableRow(index, ['Name', member, 'Active', newActive, 'Kommt', dateFormat(comming, this.config.dateformat), 'Geht', dateFormat(going, this.config.dateformat)]);
+                this.htmlTab += this.createHTMLTableRow([member, (newActive ? '<div class="mdui-green-bg mdui-state mdui-card">anwesend</div>' : '<div class="mdui-red-bg mdui-state mdui-card">abwesend</div>'), dateFormat(comming, this.config.dateformat), dateFormat(going, this.config.dateformat)]);
+            }else{
+                throw Error('object ' + member + ' does not exist!');
             }
-            let presence = {val: null, all: true, one: false, presentMembers: '', absentMembers: '', allAbsence: true, oneAbsence: false };
-            for (let k = 0; k < cfg.members.length; k++) { //loop over family members
-                if (this.enabled == false) break; //cancel if disabled over unload
-                const memberRow = cfg.members[k]; //Row from family members table
-                const member = memberRow.familymember; 
-                if (memberRow.enabled == true && this.GETBYMAC == true){ //member enabled in configuration settings and service is supported
-                    const curVal = await this.getActive(count, cfg, memberRow, dnow, presence);
-                    const dPoint = await this.getObjectAsync(`${this.namespace}` + '.' + member);
-                    count++;
-                    presence = curVal;
-                    if (curVal != null){
-                        //get history data
-                        let present = Math.round((dnow - midnight)/1000/60); //time from midnight to now = max. present time
-                        let absent = 0;
 
-                        const end = new Date().getTime();
-                        const start = midnight.getTime();
-                        let lastVal = null;
-                        let lastValCheck = false;
-                        //const gthis = this;
-                        const memb = member;
-                        if (cfg.history != ''){
-                            if (dPoint.common.custom != undefined && dPoint.common.custom[cfg.history].enabled == true){
-                                try {
-                                    const result = await this.getHistoryTable(this, cfg, memb, start, end);
-                                    if (!result) throw('Can not get history items of member ' + memb);
-                                    //this.log.info('history: ' + JSON.stringify(result));
-                                    let htmlHistory = this.HTML_HISTORY;
-                                    let jsonHistory = '[';
-                                    let bfirstFalse = false;
-                                    let firstFalse = midnight;
-                                    this.log.debug('history ' + memb + ' cntHistory: ' + result.result.length);
-                                    let cnt = 0;
-                                    
-                                    let i = 0;
-                                    for (let iv = 0; iv < result.result.length; iv++) {
-                                        if (this.enabled == false) break;
-                                        if (result.result[0].ts < result.result[result.result.length-1].ts){ //Workaround for history sorting behaviour
-                                            i = iv;
-                                        }else{
-                                            i = result.result.length - iv - 1;
-                                        }
-                                        if (result.result[i].val != null ){
-                                            const hdate = dateFormat(new Date(result.result[i].ts), cfg.dateformat);
-                                            htmlHistory += this.createHTMLTableRow([(result.result[i].val ? '<div class="mdui-green-bg mdui-state mdui-card">anwesend</div>' : '<div class="mdui-red-bg mdui-state mdui-card">abwesend</div>'), dateFormat(hdate, cfg.dateFormat)]);
-                                            jsonHistory += this.createJSONTableRow(cnt, ['Active', result.result[i].val, 'Date', dateFormat(hdate, cfg.dateFormat)]);
-                                            cnt += 1;
-                                            const hTime = new Date(result.result[i].ts);
-                                            //this.log.debug('history ' + memb + ' ' + result.result[i].val + ' time: ' + hTime);
-                                            if (hTime >= midnight.getTime()){
-                                                if (lastVal == null){
-                                                    //if no lastVal exists
-                                                    lastVal = curVal.val; 
-                                                    lastValCheck = true;
-                                                    this.log.debug(memb + ': No history item before this day is available');
-                                                }else{
-                                                    if (lastVal == false && lastValCheck == true){
-                                                        absent = Math.round((hTime - midnight.getTime())/1000/60);
-                                                        lastValCheck = false;
-                                                    }
-                                                    if (result.result[i].val == false){
-                                                        if (bfirstFalse == false){
-                                                            firstFalse = new Date(result.result[i].ts);
-                                                            bfirstFalse = true;
-                                                        }
-                                                    }
-                                                    if (result.result[i].val == true){
-                                                        if (bfirstFalse == true){
-                                                            bfirstFalse = false;
-                                                            absent += Math.round((hTime - firstFalse.getTime())/1000/60);
-                                                        }
-                                                    }
-                                                }
-                                            }else{
-                                                this.log.debug('history lastVal ' + memb + ' ' + result.result[i].val + ' time: ' + hTime);
-                                                lastVal = result.result[i].val;
-                                                lastValCheck = true;
-                                            }   
-                                        }
-                                    }
-                                    if (bfirstFalse == true){
-                                        bfirstFalse = false;
-                                        absent += Math.round((dnow - firstFalse.getTime())/1000/60);
-                                    }
-                                    present -= absent;
-                                    
-                                    this.setState(memb + '.present.sum_day', { val: present, ack: true });
-                                    this.setState(memb + '.absent.sum_day', { val: absent, ack: true });
+            if (presence != null){
+                //get history data
+                let present = Math.round((dnow - midnight)/1000/60); //time from midnight to now = max. present time
+                let absent = 0;
 
-                                    jsonHistory += ']';
-                                    htmlHistory += this.HTML_END;
-                                    this.setState(memb + '.history', { val: jsonHistory, ack: true });
-                                    this.setState(memb + '.historyHtml', { val: htmlHistory, ack: true });
-
-                                } catch (ex) {
-                                    throw('checkPresence history: ' + ex.message);
+                const end = new Date().getTime();
+                const start = midnight.getTime();
+                let lastVal = null;
+                let lastValCheck = false;
+                const memb = member;
+                if (this.config.history != '' && this.historyAlive.val === true){
+                    if (dPoint.common.custom != undefined && dPoint.common.custom[this.config.history].enabled == true){
+                        try {
+                            const result = await this.getHistoryTable(this, memb, historyPath, start, end);
+                            if (!result) throw Error('Can not get history items of member ' + memb);
+                            let htmlHistory = this.HTML_HISTORY;
+                            let jsonHistory = '[';
+                            let bfirstFalse = false;
+                            let firstFalse = midnight;
+                            this.log.debug('history ' + memb + ' cntHistory: ' + result.result.length);
+                            let cnt = 0;
+                            
+                            let i = 0;
+                            for (let iv = 0; iv < result.result.length; iv++) {
+                                if (this.enabled == false) break;
+                                if (result.result[0].ts < result.result[result.result.length-1].ts){ //Workaround for history sorting behaviour
+                                    i = iv;
+                                }else{
+                                    i = result.result.length - iv - 1;
                                 }
-                            }else{
-                                this.log.info('History from ' + memb + ' not enabled');
+                                if (result.result[i].val != null ){
+                                    //const hdate = dateFormat(new Date(result.result[i].ts), this.config.dateformat);
+                                    const hTime = new Date(result.result[i].ts);
+                                    htmlHistory += this.createHTMLTableRow([(result.result[i].val ? '<div class="mdui-green-bg mdui-state mdui-card">anwesend</div>' : '<div class="mdui-red-bg mdui-state mdui-card">abwesend</div>'), dateFormat(hTime, this.config.dateformat)]);
+                                    jsonHistory += this.createJSONTableRow(cnt, ['Active', result.result[i].val, 'Date', dateFormat(hTime, this.config.dateformat)]);
+                                    cnt += 1;
+                                    if (hTime >= midnight.getTime()){
+                                        if (lastVal == null){
+                                            //if no lastVal exists
+                                            lastVal = presence.val; 
+                                            lastValCheck = true;
+                                            this.log.debug(memb + ': No history item before this day is available');
+                                        }else{
+                                            if (lastVal == false && lastValCheck == true){
+                                                absent = Math.round((hTime - midnight.getTime())/1000/60);
+                                                lastValCheck = false;
+                                            }
+                                            if (result.result[i].val == false){
+                                                if (bfirstFalse == false){
+                                                    firstFalse = new Date(result.result[i].ts);
+                                                    bfirstFalse = true;
+                                                }
+                                            }
+                                            if (result.result[i].val == true){
+                                                if (bfirstFalse == true){
+                                                    bfirstFalse = false;
+                                                    absent += Math.round((hTime - firstFalse.getTime())/1000/60);
+                                                }
+                                            }
+                                        }
+                                    }else{
+                                        //this.log.debug('history lastVal ' + memb + ' ' + result.result[i].val + ' time: ' + hTime);
+                                        lastVal = result.result[i].val;
+                                        lastValCheck = true;
+                                    }   
+                                }
                             }
-                        }else{//history enabled
-                            this.setState(memb + '.history', { val: 'disabled', ack: true });
-                            this.setState(memb + '.historyHtml', { val: 'disabled', ack: true });
-                            this.setState(memb + '.present.sum_day', { val: -1, ack: true });
-                            this.setState(memb + '.absent.sum_day', { val: -1, ack: true });
+                            if (bfirstFalse == true){
+                                bfirstFalse = false;
+                                absent += Math.round((dnow - firstFalse.getTime())/1000/60);
+                            }
+                            present -= absent;
+                            
+                            this.setState(memberPath + '.present.sum_day', { val: present, ack: true });
+                            this.setState(memberPath + '.absent.sum_day', { val: absent, ack: true });
+
+                            jsonHistory += ']';
+                            htmlHistory += this.HTML_END;
+                            this.setState(memberPath + '.history', { val: jsonHistory, ack: true });
+                            this.setState(memberPath + '.historyHtml', { val: htmlHistory, ack: true });
+
+                        } catch (err) {
+                            throw Error(err);
                         }
                     }else{
-                        this.log.warn('can not get active state from member ' + member);
-                        break;
+                        this.log.info('History from ' + memb + ' not enabled');
                     }
-                    if (count == length) {
-                        this.jsonTab += ']';
-                        this.htmlTab += this.HTML_END;  
-
-                        this.setState('json', { val: this.jsonTab, ack: true });
-                        this.setState('html', { val: this.htmlTab, ack: true });
-                    
-                        this.setState('presenceAll', { val: presence.all, ack: true });
-                        this.setState('absenceAll', { val: presence.allAbsence, ack: true });
-                        this.setState('presence', { val: presence.one, ack: true });
-                        this.setState('absence', { val: presence.oneAbsence, ack: true });
-                        this.setState('absentMembers', { val: presence.absentMembers, ack: true });
-                        this.setState('presentMembers', { val: presence.presentMembers, ack: true });
-                        return true;
-                    }
-                }//enabled in configuration settings
-            }// for end
+                }else{//history enabled
+                    this.setState(memberPath + '.history', { val: 'disabled', ack: true });
+                    this.setState(memberPath + '.historyHtml', { val: 'disabled', ack: true });
+                    this.setState(memberPath + '.present.sum_day', { val: -1, ack: true });
+                    this.setState(memberPath + '.absent.sum_day', { val: -1, ack: true });
+                }
+            }else{
+                this.log.warn('can not get active state from member ' + member);
+            }
+            return presence;
         } catch (error) {
-            this.log.error('getActive: ' + JSON.stringify(error));            
+            this.errorHandler(error, 'calcMemberAttributes: ');
         }
     }
+
+    getMemberSpeed(memberRow){
+        const hosts = this.hosts;
+        if (hosts === null) return null;
+        const member = memberRow.familymember; 
+        let memberPath = '';
+        if (this.config.compatibility === true){
+            memberPath = memberRow.group == '' ? member : 'familyMembers.' + memberRow.group + '.' + member; 
+        } else {
+            memberPath = memberRow.group == '' ? 'familyMembers.' + member : 'familyMembers.' + memberRow.group + '.' + member; 
+        }
+        //const memberPath = memberRow.group == '' ? member : 'familyMembers.' + memberRow.group + '.' + member; 
+        //const memberPath2 = memberRow.group == '' ? 'familyMembers.' + member : 'familyMembers.' + memberRow.group + '.' + member; 
+        
+        let speed = 0;
+        let items = null;
+        if (memberRow.usage == 'Hostname' && hosts != null){
+            items = hosts.filter(x => x.hn == memberRow.devicename);
+            const itemsActive = items.filter(x => x.active == '1');
+            if (items && items.length == 0) speed = 0;
+            if (items && items.length == 1) speed = items[0].speed;
+            if (items && items.length > 1 && itemsActive && itemsActive.length > 0) speed = itemsActive[0].speed;
+        }else{
+            if (memberRow.usage == 'IP'){
+                items = hosts.filter(x => x.ip == memberRow.ipaddress);
+                const itemsActive = items.filter(x => x.active == '1');
+                if (items && items.length == 0) speed = 0;
+                if (items && items.length == 1) speed = items[0].speed;
+                if (items && items.length > 1 && itemsActive && itemsActive.length > 0) speed = itemsActive[0].speed;
+            }else{
+                items = hosts.filter(x => x.mac == memberRow.macaddress);
+                const itemsActive = items.filter(x => x.active == '1');
+                if (items && items.length == 0) speed = 0;
+                if (items && items.length == 1) speed = items[0].speed;
+                if (items && items.length > 1 && itemsActive && itemsActive.length > 0) speed = itemsActive[0].speed;
+            }
+        }
+        items = null;
+        this.setState(memberPath + '.speed', { val: parseInt(speed), ack: true });
+        //if (memberRow.group == '' && this.config.compatibility == false) this.setState(memberPath2 + '.speed', { val: speed, ack: true });
+    }
+
+    async checkPresence(){
+        try {
+            const dnow = new Date(); //Actual date and time for comparison
+            //let work = process.hrtime();
+            //let timeStr = '';
+            if(this.Fb.GETPATH === true){ //use of device list for presence if supported
+                await this.Fb.getDeviceList();
+                await this.getAllFbObjects();
+            }
+            //let time = process.hrtime(work);
+            //timeStr += 'time ' + time + 's, ';
+            //work = process.hrtime();
+
+            let membersFiltered = this.config.familymembers.filter(x => x.enabled == true); //only enabled members
+            const memberValues = []; //array for temporary values -> for filtering
+            const filteringNeeded = [];
+            //get presence from all members
+            for (let m = 0; m < membersFiltered.length; m++) {
+                const group = membersFiltered[m].group;
+                const memberRow = membersFiltered[m]; //Row from family members table
+                const member = memberRow.familymember;
+                let memberPath = '';
+                if (this.config.compatibility === true){
+                    memberPath = group == '' ? '' : 'familyMembers.' + group + '.'; 
+                } else {
+                    memberPath = group == '' ? 'familyMembers.' : 'familyMembers.' + group + '.'; 
+                }
+                const activeOld = this.getAdapterState(memberPath + member + '.presence');
+                const activeNew = await this.getActive(memberRow);
+                if (activeNew === false && activeOld != activeNew && memberRow.usefilter === true){
+                    filteringNeeded.push({oldVal: activeOld, newVal: activeNew, member: member, memberPath: memberPath, memberRow: memberRow, group: group});
+                }
+                memberValues.push({oldVal: activeOld, newVal: activeNew, member: member, memberPath: memberPath, memberRow: memberRow, group: group});
+            }
+            //time = process.hrtime(work);
+            //timeStr += time + 's, ';
+            //work = process.hrtime();
+            if (filteringNeeded.length > 0){
+                await this._sleep(this.config.delay * 1000);
+                if(this.Fb.GETPATH === true){
+                    await this.Fb.getDeviceList();
+                    await this.getAllFbObjects();
+                }
+                for (let f = 0; f < filteringNeeded.length; f++) { //loop over family members which are false
+                    if (this.enabled == false) break; //cancel if disabled over unload
+                    const memberRow = filteringNeeded[f].memberRow; //Row from family members table
+                    const activeNew = await this.getActive(memberRow);
+                    const ind = memberValues.findIndex(x => x.member == memberRow.familymember && JSON.stringify(x.memberRow) == JSON.stringify(memberRow));
+                    if(activeNew === false) memberValues[ind].newVal = activeNew;
+                }
+            }
+            //time = process.hrtime(work);
+            //timeStr += time + 's, ';
+            //work = process.hrtime();
+            
+            let familyGroups = this.removeDuplicates(membersFiltered); //family groups without duplicates
+            for (let g = 0; g < familyGroups.length; g++) {
+                if (this.enabled == false) break; //cancel if disabled over unload
+                const group = familyGroups[g];
+                const groupMembers = memberValues.filter(x => x.group == group);
+                let memberPath = '';
+                if (this.config.compatibility === true){
+                    memberPath = group == '' ? '' : 'familyMembers.' + group + '.'; 
+                } else {
+                    memberPath = group == '' ? 'familyMembers.' : 'familyMembers.' + group + '.'; 
+                }
+
+                this.jsonTab = '[';
+                this.htmlTab = this.HTML;
+                const presence = {val: null, all: true, one: false, presentMembers: '', absentMembers: '', allAbsence: true, oneAbsence: false,  presentCount: 0, absentCount: 0};
+                for (let k = 0; k < groupMembers.length; k++) { //loop over enabled family members
+                    if (this.enabled == false) break; //cancel if disabled over unload
+                    const memberRow = groupMembers[k].memberRow; //Row from family members table
+                    if (this.Fb.GETBYMAC == true){ //member enabled in configuration settings and service is supported
+                        const newActive = groupMembers[k].newVal;
+                        //this.log.info('newActive1 ' + memberRow.familymember + ' ' + newActive);
+                        if (newActive != null) await this.calcMemberAttributes(memberRow, k, newActive, dnow, presence);
+                        if (newActive != null) this.getMemberSpeed(memberRow);
+                    }
+                }
+                if (this.enabled == false) break; //cancel if disabled over unload
+
+                //group states
+                this.jsonTab += ']';
+                this.htmlTab += this.HTML_END;
+                this.setState(memberPath + 'json', { val: this.jsonTab, ack: true });
+                this.setState(memberPath + 'html', { val: this.htmlTab, ack: true });
+                this.setState(memberPath + 'presenceAll', { val: presence.all, ack: true });
+                this.setState(memberPath + 'absenceAll', { val: presence.allAbsence, ack: true });
+                this.setState(memberPath + 'presence', { val: presence.one, ack: true });
+                this.setState(memberPath + 'absence', { val: presence.oneAbsence, ack: true });
+                this.setState(memberPath + 'absentMembers', { val: presence.absentMembers, ack: true });
+                this.setState(memberPath + 'presentMembers', { val: presence.presentMembers, ack: true });
+                this.setState(memberPath + 'presentCount', { val: presence.presentCount, ack: true });
+                this.setState(memberPath + 'absentCount', { val: presence.absentCount, ack: true });
+            }
+            //time = process.hrtime(work);
+            //this.log.info(timeStr + time + 's');
+
+            membersFiltered = null;
+            familyGroups = null;
+            return true;
+        } catch (error) {
+            this.errorHandler(error, 'checkPresence: '); 
+        }
+    }
+
+    async checkPresenceOld(){
+        try {
+            const dnow = new Date(); //Actual date and time for comparison
+            //this.jsonTab = '[';
+            //this.htmlTab = this.HTML;
+            //const presence = {val: null, all: true, one: false, presentMembers: '', absentMembers: '', allAbsence: true, oneAbsence: false,  presentCount: 0, absentCount: 0};
+            let membersFiltered = this.config.familymembers.filter(x => x.enabled == true);
+            let familyGroups = this.removeDuplicates(membersFiltered);
+            let filtered = false;
+            if(this.Fb.GETPATH === true){
+                await this.Fb.getDeviceList();
+                await this.getAllFbObjects();
+            }
+
+            for (let g = 0; g < familyGroups.length; g++) {
+                const group = familyGroups[g];
+                const toFilter = [];
+
+                const groupMembers = membersFiltered.filter(x => x.group == group);
+                //const memberPath = group == '' ? '' : 'familyMembers.' + group + '.'; 
+
+                let memberPath = '';
+                if (this.config.compatibility === true){
+                    memberPath = group == '' ? '' : 'familyMembers.' + group + '.'; 
+                } else {
+                    memberPath = group == '' ? 'familyMembers.' : 'familyMembers.' + group + '.'; 
+                }
+
+                this.jsonTab = '[';
+                this.htmlTab = this.HTML;
+                const presence = {val: null, all: true, one: false, presentMembers: '', absentMembers: '', allAbsence: true, oneAbsence: false,  presentCount: 0, absentCount: 0};
+                for (let k = 0; k < groupMembers.length; k++) { //loop over enabled family members
+                    if (this.enabled == false) break; //cancel if disabled over unload
+                    const memberRow = groupMembers[k]; //Row from family members table
+                    if (this.Fb.GETBYMAC == true){ //member enabled in configuration settings and service is supported
+                        const member = memberRow.familymember;
+                        const state = this.getAdapterState(memberPath + member + '.presence');
+                        const newActive = await this.getActive(memberRow);
+                        if (newActive === false && memberRow.usefilter === true && state === true) {
+                            toFilter.push({id: member, path: memberPath, row: memberRow, active: newActive});
+                        }else{
+                            if (newActive != null) await this.calcMemberAttributes(memberRow, k, newActive, dnow, presence);
+                            if (newActive != null) this.getMemberSpeed(memberRow);
+                        }
+                    }
+                }
+                if (toFilter.length > 0){
+                    await this._sleep(this.config.delay * 1000);
+                    if(this.Fb.GETPATH === true && filtered === false){
+                        await this.Fb.getDeviceList();
+                        await this.getAllFbObjects();
+                        filtered = true;
+                    } 
+                    for (let k = 0; k < toFilter.length; k++) { //loop over family members which are false
+                        if (this.enabled == false) break; //cancel if disabled over unload
+                        const memberRow = toFilter[k].row; //Row from family members table
+                        if (this.Fb.GETBYMAC == true){ //member enabled in configuration settings and service is supported
+                            const newActive = await this.getActive(memberRow);
+                            if (newActive != null) await this.calcMemberAttributes(memberRow, k, newActive, dnow, presence);
+                            if (newActive != null) this.getMemberSpeed(memberRow);
+                        }
+                    }
+                }
+                //groupMembers = null;
+                if (this.enabled == false) break; //cancel if disabled over unload
+
+                this.jsonTab += ']';
+                this.htmlTab += this.HTML_END;
+                this.setState(memberPath + 'json', { val: this.jsonTab, ack: true });
+                this.setState(memberPath + 'html', { val: this.htmlTab, ack: true });
+                this.setState(memberPath + 'presenceAll', { val: presence.all, ack: true });
+                this.setState(memberPath + 'absenceAll', { val: presence.allAbsence, ack: true });
+                this.setState(memberPath + 'presence', { val: presence.one, ack: true });
+                this.setState(memberPath + 'absence', { val: presence.oneAbsence, ack: true });
+                this.setState(memberPath + 'absentMembers', { val: presence.absentMembers, ack: true });
+                this.setState(memberPath + 'presentMembers', { val: presence.presentMembers, ack: true });
+                this.setState(memberPath + 'presentCount', { val: presence.presentCount, ack: true });
+                this.setState(memberPath + 'absentCount', { val: presence.absentCount, ack: true });
+            }
+
+            membersFiltered = null;
+            familyGroups = null;
+            //this.jsonTab += ']';
+            //this.htmlTab += this.HTML_END;
+
+            /*this.setState('json', { val: this.jsonTab, ack: true });
+            this.setState('html', { val: this.htmlTab, ack: true });
+        
+            this.setState('presenceAll', { val: presence.all, ack: true });
+            this.setState('absenceAll', { val: presence.allAbsence, ack: true });
+            this.setState('presence', { val: presence.one, ack: true });
+            this.setState('absence', { val: presence.oneAbsence, ack: true });
+            this.setState('absentMembers', { val: presence.absentMembers, ack: true });
+            this.setState('presentMembers', { val: presence.presentMembers, ack: true });
+            this.setState('presentCount', { val: presence.presentCount, ack: true });
+            this.setState('absentCount', { val: presence.absentCount, ack: true });*/
+            return true;
+        } catch (error) {
+            this.errorHandler(error, 'checkPresence: '); 
+            //this.log.error('checkPresence: ' + JSON.stringify(error));            
+        }
+    }
+
+    removeDuplicates(array) {
+        const a = [];
+        array.map(x => {
+            if (!a.includes(x.group)) {
+                a.push(x.group);
+            }});
+        return a;
+    }  
 }
 
-if (module.parent) {
+process.on('SIGINT', function() {
+    console.log('process_on');
+    //stopAll();
+    //stopProxy();
+    //setConnected(false);
+});
+
+process.on('uncaughtException', function(err) {
+    console.log('process_on: ' + err.toString());
+    //console.log('Exception: ' + err + '/' + err.toString());
+    /*if (adapter && adapter.log) {
+        adapter.log.warn('Exception: ' + err);
+    }*/
+    //stopAll();
+    //stopProxy();
+    //setConnected(false);
+});
+
+if (require.main !== module) {
     // Export the constructor in compact mode
     /**
      * @param {Partial<ioBroker.AdapterOptions>} [options={}]

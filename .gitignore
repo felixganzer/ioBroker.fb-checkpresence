@@ -1,3 +1,7 @@
+.*/
+!.vscode/
+!.github/
+
 .git
 .idea
 node_modules
@@ -18,9 +22,8 @@ scripts/upload.sh
 scripts/gulp.sh
 scripts/update_node.sh
 
-.vscode
-.vscode/tasks.json
-.vscode/launch.json
-
 iob_npm.done
-package-lock.json
+
+
+# ioBroker dev-server
+.dev-server/
